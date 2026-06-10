@@ -1,3 +1,6 @@
 .secrets/
 *.log
 .DS_Store
+config/guardrails-poc.env
+config/harbor.txt
+config/license.txt

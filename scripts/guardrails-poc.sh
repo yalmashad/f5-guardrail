@@ -145,6 +145,17 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
 }
 
+resolve_repo_path() {
+  local path="$1"
+  if [[ -z "$path" ]]; then
+    printf '\n'
+  elif [[ "$path" = /* ]]; then
+    printf '%s\n' "$path"
+  else
+    printf '%s/%s\n' "$ROOT_DIR" "$path"
+  fi
+}
+
 require_tools() {
   need_cmd aws
   need_cmd kubectl
@@ -180,11 +191,13 @@ read_harbor_credentials() {
     return
   fi
 
-  [[ -n "$HARBOR_CREDENTIALS_FILE" ]] || die "Set HARBOR_USERNAME/HARBOR_PASSWORD or HARBOR_CREDENTIALS_FILE"
-  [[ -f "$HARBOR_CREDENTIALS_FILE" ]] || die "Harbor credentials file not found: $HARBOR_CREDENTIALS_FILE"
+  local credentials_file
+  credentials_file="$(resolve_repo_path "$HARBOR_CREDENTIALS_FILE")"
+  [[ -n "$credentials_file" ]] || die "Set HARBOR_USERNAME/HARBOR_PASSWORD or HARBOR_CREDENTIALS_FILE"
+  [[ -f "$credentials_file" ]] || die "Harbor credentials file not found: $credentials_file"
 
-  HARBOR_USERNAME="$(grep -v '^[[:space:]]*$' "$HARBOR_CREDENTIALS_FILE" | sed -n '1p')"
-  HARBOR_PASSWORD="$(grep -v '^[[:space:]]*$' "$HARBOR_CREDENTIALS_FILE" | sed -n '2p')"
+  HARBOR_USERNAME="$(grep -v '^[[:space:]]*$' "$credentials_file" | sed -n '1p')"
+  HARBOR_PASSWORD="$(grep -v '^[[:space:]]*$' "$credentials_file" | sed -n '2p')"
   [[ -n "$HARBOR_USERNAME" && -n "$HARBOR_PASSWORD" ]] || die "Harbor credentials file must contain username and password on separate lines"
 }
 
@@ -193,9 +206,11 @@ read_license() {
     return
   fi
 
-  [[ -n "$F5_LICENSE_FILE" ]] || die "Set F5_LICENSE_STRING or F5_LICENSE_FILE"
-  [[ -f "$F5_LICENSE_FILE" ]] || die "F5 license file not found: $F5_LICENSE_FILE"
-  F5_LICENSE_STRING="$(tr -d '\r\n' < "$F5_LICENSE_FILE")"
+  local license_file
+  license_file="$(resolve_repo_path "$F5_LICENSE_FILE")"
+  [[ -n "$license_file" ]] || die "Set F5_LICENSE_STRING or F5_LICENSE_FILE"
+  [[ -f "$license_file" ]] || die "F5 license file not found: $license_file"
+  F5_LICENSE_STRING="$(tr -d '\r\n' < "$license_file")"
   [[ -n "$F5_LICENSE_STRING" ]] || die "F5 license string is empty"
 }
 
@@ -205,7 +220,8 @@ ensure_secret_dir() {
 }
 
 get_or_create_postgres_password() {
-  local path="$ROOT_DIR/$POSTGRES_PASSWORD_FILE"
+  local path
+  path="$(resolve_repo_path "$POSTGRES_PASSWORD_FILE")"
   ensure_secret_dir
 
   if [[ -f "$path" ]]; then
@@ -263,8 +279,6 @@ install_storage_addons() {
 }
 
 create_harbor_secret() {
-  read_harbor_credentials
-
   if [[ "$DRY_RUN" == true ]]; then
     run kubectl create namespace "$F5_NAMESPACE" --dry-run=client -o yaml
     printf '+ kubectl apply -f -\n'
@@ -272,6 +286,7 @@ create_harbor_secret() {
     return
   fi
 
+  read_harbor_credentials
   kubectl create namespace "$F5_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
   local tmpdir auth
@@ -301,11 +316,11 @@ PY
 }
 
 helm_login_harbor() {
-  read_harbor_credentials
   if [[ "$DRY_RUN" == true ]]; then
     printf '+ helm registry login %s --username <harbor-user> --password-stdin\n' "$HARBOR_REGISTRY"
     return
   fi
+  read_harbor_credentials
   printf '%s\n' "$HARBOR_PASSWORD" | helm registry login "$HARBOR_REGISTRY" --username "$HARBOR_USERNAME" --password-stdin
 }
 
@@ -316,15 +331,14 @@ install_operator() {
 }
 
 apply_security_operator() {
-  read_license
-  get_or_create_postgres_password
-
   if [[ "$DRY_RUN" == true ]]; then
     printf '+ kubectl apply -f <SecurityOperator manifest for %s>\n' "$SECURITY_OPERATOR_NAME"
     printf '  SecurityOperator manifest: Guardrails enabled, Red Team disabled, in-cluster PostgreSQL enabled, CAI_MODERATOR_BASE_URL=https://%s\n' "$HOSTNAME"
     return
   fi
 
+  read_license
+  get_or_create_postgres_password
   local manifest
   manifest="$(mktemp)"
   MANIFEST_PATH="$manifest" \

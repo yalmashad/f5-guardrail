@@ -107,7 +107,7 @@ Required inputs:
 
 - F5 AI Security license string
 - Harbor registry username and password for `harbor.calypsoai.app`
-- AWS CLI credentials with permission to create EKS, EC2, IAM, CloudFormation, ELB, and Route 53 resources
+- AWS CLI installed and configured with credentials that can create EKS, EC2, IAM, CloudFormation, ELB, EBS, and Route 53 resources
 - Public hosted zone for the selected hostname
 - LLM provider credentials for post-install application configuration
 
@@ -483,7 +483,7 @@ kubectl get svc -n ingress-nginx ingress-nginx-controller -o wide
 For this PoC, a self-signed certificate was used.
 
 ```bash
-tmpdir=$(mktemp -d /private/tmp/guardrails-tls.XXXXXX)
+tmpdir=$(mktemp -d)
 
 openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
   -keyout "$tmpdir/tls.key" \
@@ -786,9 +786,11 @@ Edit `config/guardrails-poc.env` if you want to change cluster name, region, ins
 By default, the script references:
 
 ```bash
-HARBOR_CREDENTIALS_FILE="/Users/y.elmashad/F5/Labs/ai/guardrail/license/harbor.txt"
-F5_LICENSE_FILE="/Users/y.elmashad/F5/Labs/ai/guardrail/license/license.txt"
+HARBOR_CREDENTIALS_FILE="config/harbor.txt"
+F5_LICENSE_FILE="config/license.txt"
 ```
+
+Relative paths in `config/guardrails-poc.env` are resolved from the repository root, so the same config works after cloning the repo on another machine.
 
 The Harbor credentials file format is:
 
@@ -798,6 +800,14 @@ The Harbor credentials file format is:
 ```
 
 The license file should contain the license string as its full content.
+
+These local secret files are ignored by Git. Create them after cloning:
+
+```bash
+printf '%s\n%s\n' '<harbor username>' '<harbor password>' > config/harbor.txt
+printf '%s\n' '<F5 license string>' > config/license.txt
+chmod 600 config/harbor.txt config/license.txt
+```
 
 You can also override secrets at runtime without changing the config file:
 
@@ -816,6 +826,34 @@ The script stores the generated PostgreSQL password in:
 ```
 
 That directory is ignored by Git. Remove the file if you want a fresh generated PostgreSQL password on the next deployment.
+
+### AWS Credentials on Another Machine
+
+The script does not store or manage AWS credentials. It assumes the AWS CLI is already installed and authenticated on the machine running the script.
+
+On a new machine, configure AWS before running `up`, `down`, or `status`:
+
+```bash
+aws configure
+aws sts get-caller-identity
+aws configure get region
+```
+
+Use an IAM user or role with permission for:
+
+- EKS cluster and add-on lifecycle
+- EC2 instances, VPCs, security groups, EBS volumes, and network interfaces
+- Elastic Load Balancing
+- IAM roles and policies created by `eksctl`
+- CloudFormation stacks created by `eksctl`
+- Route 53 hosted zone record changes for the configured hostname
+
+If you use AWS SSO or named profiles, authenticate first and pass the profile through the environment:
+
+```bash
+aws sso login --profile <profile-name>
+AWS_PROFILE=<profile-name> ./scripts/guardrails-poc.sh up
+```
 
 ### Test Without Touching AWS
 
