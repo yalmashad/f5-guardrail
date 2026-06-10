@@ -103,6 +103,8 @@ helm version --short
 eksctl version
 ```
 
+The automation script checks these tools before deployment and reports missing prerequisites in a readable checklist.
+
 Required inputs:
 
 - F5 AI Security license string
@@ -110,6 +112,21 @@ Required inputs:
 - AWS CLI installed and configured with credentials that can create EKS, EC2, IAM, CloudFormation, ELB, EBS, and Route 53 resources
 - Public hosted zone for the selected hostname
 - LLM provider credentials for post-install application configuration
+
+AWS credentials are not stored in this repository. The script uses the normal AWS CLI credential chain, so each machine that runs it must have one of these configured before deployment:
+
+```bash
+aws configure
+# or
+export AWS_PROFILE=<profile-name>
+aws sso login --profile <profile-name>
+```
+
+Validate access before deploying:
+
+```bash
+aws sts get-caller-identity
+```
 
 The PoC used:
 
@@ -122,6 +139,26 @@ TLS:      self-signed certificate
 ```
 
 ## Preflight Checks
+
+Run the built-in prerequisite check before creating AWS resources:
+
+```bash
+./scripts/guardrails-poc.sh preflight
+```
+
+The preflight check validates:
+
+- Required local tools: `aws`, `kubectl`, `helm`, `eksctl`, `openssl`, `python3`, and `curl`
+- AWS credentials and selected region access
+- Route 53 hosted zone for the configured hostname
+- GPU instance type availability in the selected region
+- EC2 GPU On-Demand quota visibility
+- Harbor credentials file or environment variables
+- Harbor registry login
+- F5 license file or environment variable
+- `eksctl` cluster configuration dry-run
+
+If anything is missing, fix the item marked `[FAIL]` and rerun `preflight`.
 
 Verify AWS identity:
 
@@ -749,6 +786,7 @@ Then remove the Route 53 CNAME if it is no longer needed.
 The repository includes a reusable automation script for deleting the PoC when it is not needed and recreating it later with minimal interaction.
 
 ```bash
+./scripts/guardrails-poc.sh preflight
 ./scripts/guardrails-poc.sh up
 ./scripts/guardrails-poc.sh status
 ./scripts/guardrails-poc.sh down --yes
@@ -772,6 +810,8 @@ The script covers the full deployment path used in this PoC, including the issue
 - Route 53 CNAME upsert and delete
 - Post-delete cleanup of available EBS volumes still tagged as owned by the PoC cluster
 - Public URL validation
+
+Before deployment, the script runs a preflight gate and prints a readable checklist for missing tools, AWS access, Route 53, Harbor credentials, license input, GPU instance availability, and `eksctl` cluster configuration.
 
 ### Configure Automation
 
@@ -866,6 +906,14 @@ Use dry-run mode:
 ```
 
 ### Start the PoC
+
+Check prerequisites first:
+
+```bash
+./scripts/guardrails-poc.sh preflight
+```
+
+Then deploy:
 
 ```bash
 ./scripts/guardrails-poc.sh up

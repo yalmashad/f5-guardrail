@@ -8,6 +8,7 @@ EXAMPLE_CONFIG="$ROOT_DIR/config/guardrails-poc.env.example"
 CONFIG_FILE="$DEFAULT_CONFIG"
 DRY_RUN=false
 ASSUME_YES=false
+PREFLIGHT_FAILURES=0
 
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
@@ -21,6 +22,7 @@ die() {
 usage() {
   cat <<'EOF'
 Usage:
+  scripts/guardrails-poc.sh [--config FILE] preflight
   scripts/guardrails-poc.sh [--config FILE] [--dry-run] up
   scripts/guardrails-poc.sh [--config FILE] [--dry-run] down [--yes]
   scripts/guardrails-poc.sh [--config FILE] [--dry-run] status
@@ -36,6 +38,7 @@ Secret inputs:
 
 Examples:
   cp config/guardrails-poc.env.example config/guardrails-poc.env
+  scripts/guardrails-poc.sh preflight
   scripts/guardrails-poc.sh up
   scripts/guardrails-poc.sh status
   scripts/guardrails-poc.sh down --yes
@@ -61,7 +64,7 @@ while [[ $# -gt 0 ]]; do
       usage
       exit 0
       ;;
-    up|down|status)
+    preflight|up|down|status)
       ACTION="$1"
       shift
       ;;
@@ -163,6 +166,320 @@ require_tools() {
   need_cmd eksctl
   need_cmd openssl
   need_cmd python3
+  need_cmd curl
+}
+
+preflight_ok() {
+  printf '  [OK]   %s\n' "$*"
+}
+
+preflight_warn() {
+  printf '  [WARN] %s\n' "$*"
+}
+
+preflight_fail() {
+  PREFLIGHT_FAILURES=$((PREFLIGHT_FAILURES + 1))
+  printf '  [FAIL] %s\n' "$*"
+}
+
+command_version() {
+  case "$1" in
+    aws) aws --version 2>&1 | awk '{print $1}' ;;
+    kubectl) kubectl version --client=true 2>/dev/null | head -1 ;;
+    helm) helm version --short 2>/dev/null ;;
+    eksctl) eksctl version 2>/dev/null ;;
+    openssl) openssl version 2>/dev/null ;;
+    python3) python3 --version 2>&1 ;;
+    curl) curl --version 2>/dev/null | head -1 ;;
+    *) "$1" --version 2>/dev/null | head -1 ;;
+  esac
+}
+
+check_command() {
+  local cmd="$1"
+  if command -v "$cmd" >/dev/null 2>&1; then
+    preflight_ok "$cmd found: $(command_version "$cmd")"
+  else
+    preflight_fail "$cmd is not installed or not in PATH"
+  fi
+}
+
+check_secret_file() {
+  local label="$1"
+  local configured_path="$2"
+  local env_name="$3"
+  local resolved_path
+  resolved_path="$(resolve_repo_path "$configured_path")"
+
+  if [[ -n "${!env_name:-}" ]]; then
+    preflight_ok "$label supplied by environment variable $env_name"
+    return
+  fi
+
+  if [[ -z "$resolved_path" ]]; then
+    preflight_fail "$label is missing. Set $env_name or configure a file path."
+  elif [[ -f "$resolved_path" ]]; then
+    if [[ -s "$resolved_path" ]]; then
+      preflight_ok "$label file exists: ${configured_path}"
+    else
+      preflight_fail "$label file is empty: ${configured_path}"
+    fi
+  else
+    preflight_fail "$label file not found: ${configured_path}"
+  fi
+}
+
+check_harbor_secret_input() {
+  local credentials_file
+  credentials_file="$(resolve_repo_path "$HARBOR_CREDENTIALS_FILE")"
+
+  if [[ -n "${HARBOR_USERNAME:-}" || -n "${HARBOR_PASSWORD:-}" ]]; then
+    if [[ -n "${HARBOR_USERNAME:-}" && -n "${HARBOR_PASSWORD:-}" ]]; then
+      preflight_ok "Harbor credentials supplied by HARBOR_USERNAME/HARBOR_PASSWORD"
+    else
+      preflight_fail "Harbor environment variables are incomplete. Set both HARBOR_USERNAME and HARBOR_PASSWORD."
+    fi
+    return
+  fi
+
+  if [[ -z "$credentials_file" ]]; then
+    preflight_fail "Harbor credentials are missing. Set HARBOR_USERNAME/HARBOR_PASSWORD or HARBOR_CREDENTIALS_FILE."
+  elif [[ -f "$credentials_file" ]]; then
+    if [[ -s "$credentials_file" ]]; then
+      preflight_ok "Harbor credentials file exists: ${HARBOR_CREDENTIALS_FILE}"
+    else
+      preflight_fail "Harbor credentials file is empty: ${HARBOR_CREDENTIALS_FILE}"
+    fi
+  else
+    preflight_fail "Harbor credentials file not found: ${HARBOR_CREDENTIALS_FILE}"
+  fi
+}
+
+check_harbor_file_format() {
+  if [[ -n "${HARBOR_USERNAME:-}" && -n "${HARBOR_PASSWORD:-}" ]]; then
+    return
+  fi
+
+  local credentials_file username password
+  credentials_file="$(resolve_repo_path "$HARBOR_CREDENTIALS_FILE")"
+  [[ -f "$credentials_file" ]] || return 0
+  username="$(grep -v '^[[:space:]]*$' "$credentials_file" | sed -n '1p')"
+  password="$(grep -v '^[[:space:]]*$' "$credentials_file" | sed -n '2p')"
+  if [[ -n "$username" && -n "$password" ]]; then
+    preflight_ok "Harbor credentials file has username and password lines"
+  else
+    preflight_fail "Harbor credentials file must contain username on line 1 and password on line 2"
+  fi
+}
+
+check_aws_credentials() {
+  local identity account arn
+  if ! identity="$(aws sts get-caller-identity --output json 2>/dev/null)"; then
+    preflight_fail "AWS credentials are not working. Run aws configure, export AWS_PROFILE, or aws sso login."
+    return
+  fi
+
+  account="$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Account","unknown"))')"
+  arn="$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Arn","unknown"))')"
+  preflight_ok "AWS identity works: account ${account}, principal ${arn}"
+}
+
+check_aws_region() {
+  if aws ec2 describe-regions --region "$AWS_REGION" --region-names "$AWS_REGION" >/dev/null 2>&1; then
+    preflight_ok "AWS region is reachable: $AWS_REGION"
+  else
+    preflight_fail "AWS region is not reachable or not enabled: $AWS_REGION"
+  fi
+}
+
+check_route53_zone() {
+  local zone_id
+  if ! zone_id="$(resolve_hosted_zone_id 2>/dev/null)"; then
+    preflight_fail "Unable to query Route 53 hosted zone for $ROUTE53_ZONE_NAME"
+    return
+  fi
+
+  if [[ -n "$zone_id" && "$zone_id" != "None" ]]; then
+    preflight_ok "Route 53 hosted zone found for $ROUTE53_ZONE_NAME: $zone_id"
+  else
+    preflight_fail "Route 53 hosted zone not found for $ROUTE53_ZONE_NAME"
+  fi
+}
+
+check_instance_offering() {
+  local count
+  count="$(aws ec2 describe-instance-type-offerings \
+    --region "$AWS_REGION" \
+    --location-type availability-zone \
+    --filters "Name=instance-type,Values=$NODE_TYPE" \
+    --query 'length(InstanceTypeOfferings)' \
+    --output text 2>/dev/null || printf '0')"
+  if [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]; then
+    preflight_ok "Instance type $NODE_TYPE is offered in $AWS_REGION ($count AZs)"
+  else
+    preflight_fail "Instance type $NODE_TYPE does not appear available in $AWS_REGION"
+  fi
+}
+
+check_gpu_quota() {
+  local quotas quota
+  quotas="$(aws service-quotas list-service-quotas \
+    --service-code ec2 \
+    --region "$AWS_REGION" \
+    --output json 2>/dev/null || true)"
+  quota="$(QUOTAS_JSON="$quotas" python3 - <<'PY' 2>/dev/null || true
+import json, os
+try:
+    data = json.loads(os.environ.get("QUOTAS_JSON", ""))
+except Exception:
+    print("")
+    raise SystemExit
+for quota in data.get("Quotas", []):
+    if quota.get("QuotaCode") == "L-DB2E81BA":
+        print(quota.get("Value", ""))
+        break
+PY
+)"
+  if [[ -z "$quota" || "$quota" == "None" ]]; then
+    preflight_warn "Could not read EC2 G/VT On-Demand quota; continuing because AWS will enforce quota during node creation"
+  else
+    preflight_ok "EC2 G/VT On-Demand quota is visible: ${quota} vCPUs"
+  fi
+}
+
+check_eksctl_cluster_config() {
+  if cluster_exists; then
+    preflight_ok "EKS cluster already exists; up will reuse it: $CLUSTER_NAME"
+    return
+  fi
+
+  if eksctl create cluster \
+    --name "$CLUSTER_NAME" \
+    --region "$AWS_REGION" \
+    --version "$K8S_VERSION" \
+    --managed \
+    --nodegroup-name "$NODEGROUP_NAME" \
+    --node-type "$NODE_TYPE" \
+    --nodes "$NODE_COUNT" \
+    --nodes-min "$NODE_MIN" \
+    --nodes-max "$NODE_MAX" \
+    --node-volume-size "$NODE_VOLUME_SIZE" \
+    --node-ami-family "$NODE_AMI_FAMILY" \
+    --vpc-nat-mode "$VPC_NAT_MODE" \
+    --dry-run >/dev/null 2>&1; then
+    preflight_ok "eksctl accepts the cluster configuration for Kubernetes $K8S_VERSION"
+  else
+    preflight_fail "eksctl dry-run failed. Check eksctl version, Kubernetes version $K8S_VERSION, AWS credentials, and cluster config."
+  fi
+}
+
+check_harbor_login() {
+  local credentials_file username password
+
+  if [[ -n "${HARBOR_USERNAME:-}" && -n "${HARBOR_PASSWORD:-}" ]]; then
+    username="$HARBOR_USERNAME"
+    password="$HARBOR_PASSWORD"
+  else
+    credentials_file="$(resolve_repo_path "$HARBOR_CREDENTIALS_FILE")"
+    if [[ ! -f "$credentials_file" ]]; then
+      preflight_warn "Skipping Harbor login validation because credentials are missing"
+      return
+    fi
+    username="$(grep -v '^[[:space:]]*$' "$credentials_file" | sed -n '1p')"
+    password="$(grep -v '^[[:space:]]*$' "$credentials_file" | sed -n '2p')"
+  fi
+
+  if [[ -z "$username" || -z "$password" ]]; then
+    preflight_warn "Skipping Harbor login validation because credentials are incomplete"
+    return
+  fi
+
+  if printf '%s\n' "$password" | helm registry login "$HARBOR_REGISTRY" --username "$username" --password-stdin >/dev/null 2>&1; then
+    preflight_ok "Harbor registry login succeeded for $HARBOR_REGISTRY"
+  else
+    preflight_fail "Harbor registry login failed for $HARBOR_REGISTRY"
+  fi
+}
+
+check_license_string() {
+  local license_file
+
+  if [[ -n "${F5_LICENSE_STRING:-}" ]]; then
+    preflight_ok "F5 license string is present"
+    return
+  fi
+
+  license_file="$(resolve_repo_path "$F5_LICENSE_FILE")"
+  if [[ ! -f "$license_file" ]]; then
+    preflight_warn "Skipping license content validation because license file is missing"
+    return
+  fi
+
+  if [[ -s "$license_file" && -n "$(tr -d '\r\n' < "$license_file")" ]]; then
+    preflight_ok "F5 license string is present"
+  else
+    preflight_fail "F5 license file is empty"
+  fi
+}
+
+preflight_up() {
+  local mode="${1:-deploy}"
+
+  if [[ "$DRY_RUN" == true ]]; then
+    printf '\nPreflight checks skipped in --dry-run mode. Dry-run prints planned commands only.\n\n'
+    return
+  fi
+
+  PREFLIGHT_FAILURES=0
+  printf '\nGuardrails PoC preflight\n'
+  printf '========================\n'
+  printf 'Config file:            %s\n' "$CONFIG_FILE"
+  printf 'Cluster:                %s (%s)\n' "$CLUSTER_NAME" "$AWS_REGION"
+  printf 'Node group:             %s (%s x %s)\n' "$NODEGROUP_NAME" "$NODE_COUNT" "$NODE_TYPE"
+  printf 'Hostname:               %s\n' "$HOSTNAME"
+  printf '\nLocal tools\n'
+  for cmd in aws kubectl helm eksctl openssl python3 curl; do
+    check_command "$cmd"
+  done
+  local tool_failures="$PREFLIGHT_FAILURES"
+
+  printf '\nSecret inputs\n'
+  check_harbor_secret_input
+  check_harbor_file_format
+  check_secret_file "F5 license" "$F5_LICENSE_FILE" "F5_LICENSE_STRING"
+
+  if [[ "$tool_failures" -gt 0 ]]; then
+    printf '\nAWS access\n'
+    preflight_warn "Skipped because one or more required local tools are missing"
+    printf '\nDeployment validation\n'
+    preflight_warn "Skipped because one or more required local tools are missing"
+  else
+    printf '\nAWS access\n'
+    check_aws_credentials
+    check_aws_region
+    check_route53_zone
+    check_instance_offering
+    check_gpu_quota
+
+    printf '\nDeployment validation\n'
+    check_eksctl_cluster_config
+    check_harbor_login
+    check_license_string
+  fi
+
+  if [[ "$PREFLIGHT_FAILURES" -gt 0 ]]; then
+    printf '\nPreflight failed with %s issue(s). Fix the items marked [FAIL], then rerun:\n' "$PREFLIGHT_FAILURES"
+    printf '  ./scripts/guardrails-poc.sh preflight\n\n'
+    exit 1
+  fi
+
+  if [[ "$mode" == "check" ]]; then
+    printf '\nPreflight passed. The environment is ready to deploy.\n'
+    printf 'Start deployment with:\n'
+    printf '  ./scripts/guardrails-poc.sh up\n\n'
+  else
+    printf '\nPreflight passed. Starting deployment.\n\n'
+  fi
 }
 
 cluster_exists() {
@@ -709,7 +1026,7 @@ verify_public_url() {
 }
 
 do_up() {
-  require_tools
+  preflight_up deploy
   create_cluster
   install_storage_addons
   create_harbor_secret
@@ -725,6 +1042,10 @@ do_up() {
   route53_upsert "$lb"
   verify_public_url
   status
+}
+
+do_preflight() {
+  preflight_up check
 }
 
 do_down() {
@@ -781,6 +1102,7 @@ status() {
 load_config
 
 case "$ACTION" in
+  preflight) do_preflight ;;
   up) do_up ;;
   down) do_down ;;
   status) require_tools; status ;;
