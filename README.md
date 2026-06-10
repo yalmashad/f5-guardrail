@@ -827,12 +827,6 @@ Use dry-run mode:
 ./scripts/guardrails-poc.sh --dry-run down --yes
 ```
 
-Run the included dry-run test:
-
-```bash
-bash tests/test_guardrails_poc.sh
-```
-
 ### Start the PoC
 
 ```bash
