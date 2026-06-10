@@ -703,13 +703,21 @@ Password: pass
 
 The main Guardrails UI account page does not expose password management.
 
-Use the embedded Keycloak account console:
+Use the embedded Keycloak account console. For this PoC deployment, the Guardrails UI login uses the `master` realm:
+
+```text
+https://guardrails.f5demo.io/auth/realms/master/account/#/security/signingin
+```
+
+The deployment can also expose a `calypsoai` realm:
 
 ```text
 https://guardrails.f5demo.io/auth/realms/calypsoai/account/#/security/signingin
 ```
 
-After login, change the password under the account security/sign-in area.
+Keycloak passwords are realm-specific. Changing the `admin` password in `master` does not automatically change the `admin` password in `calypsoai`. If both realms accept the initial password, rotate the password in both account consoles.
+
+After login, change the password under **Account Security** -> **Signing in** -> **Update password**.
 
 ## Useful Commands
 
@@ -828,6 +836,9 @@ By default, the script references:
 ```bash
 HARBOR_CREDENTIALS_FILE="config/harbor.txt"
 F5_LICENSE_FILE="config/license.txt"
+GUARDRAILS_DEFAULT_USERNAME="admin"
+GUARDRAILS_DEFAULT_PASSWORD="pass"
+GUARDRAILS_AUTH_REALMS="master calypsoai"
 ```
 
 Relative paths in `config/guardrails-poc.env` are resolved from the repository root, so the same config works after cloning the repo on another machine.
@@ -920,6 +931,8 @@ Then deploy:
 ```
 
 Expected runtime is roughly 25-45 minutes because the script creates a new EKS control plane, GPU node, add-ons, images, model pod, ingress load balancer, and DNS record.
+
+At the end, the script prints a concise status summary with the UI URL, initial login credentials, and Keycloak account-console links for changing the password.
 
 ### Stop the PoC and Minimize Cost
 

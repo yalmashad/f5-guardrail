@@ -104,6 +104,9 @@ load_config() {
   HOSTNAME="${HOSTNAME:-guardrails.f5demo.io}"
   ROUTE53_ZONE_NAME="${ROUTE53_ZONE_NAME:-${HOSTNAME#*.}}"
   ROUTE53_HOSTED_ZONE_ID="${ROUTE53_HOSTED_ZONE_ID:-}"
+  GUARDRAILS_DEFAULT_USERNAME="${GUARDRAILS_DEFAULT_USERNAME:-admin}"
+  GUARDRAILS_DEFAULT_PASSWORD="${GUARDRAILS_DEFAULT_PASSWORD:-pass}"
+  GUARDRAILS_AUTH_REALMS="${GUARDRAILS_AUTH_REALMS:-master calypsoai}"
   HARBOR_REGISTRY="${HARBOR_REGISTRY:-harbor.calypsoai.app}"
   HARBOR_CREDENTIALS_FILE="${HARBOR_CREDENTIALS_FILE:-}"
   F5_LICENSE_FILE="${F5_LICENSE_FILE:-}"
@@ -752,7 +755,36 @@ PY' >/dev/null 2>&1; do
 install_ingress() {
   run helm repo add "$INGRESS_REPO_NAME" "$INGRESS_REPO_URL" --force-update
   run helm repo update "$INGRESS_REPO_NAME"
-  run helm upgrade --install "$INGRESS_RELEASE" "$INGRESS_CHART" --namespace "$INGRESS_NAMESPACE" --create-namespace --set 'controller.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type=nlb' --set 'controller.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing' --set controller.service.externalTrafficPolicy=Local
+
+  if [[ "$DRY_RUN" == true ]]; then
+    run helm upgrade --install "$INGRESS_RELEASE" "$INGRESS_CHART" --namespace "$INGRESS_NAMESPACE" --create-namespace --set 'controller.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type=nlb' --set 'controller.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing' --set controller.service.externalTrafficPolicy=Local
+    run kubectl rollout status -n "$INGRESS_NAMESPACE" deploy/ingress-nginx-controller --timeout=300s
+    return
+  fi
+
+  local attempt status
+  for attempt in 1 2; do
+    log "helm upgrade --install $INGRESS_RELEASE $INGRESS_CHART --namespace $INGRESS_NAMESPACE"
+    if helm upgrade --install "$INGRESS_RELEASE" "$INGRESS_CHART" \
+      --namespace "$INGRESS_NAMESPACE" \
+      --create-namespace \
+      --set 'controller.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type=nlb' \
+      --set 'controller.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing' \
+      --set controller.service.externalTrafficPolicy=Local; then
+      break
+    fi
+
+    status="$(helm status "$INGRESS_RELEASE" -n "$INGRESS_NAMESPACE" -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("info", {}).get("status", "unknown"))' 2>/dev/null || printf 'not-found')"
+    if [[ "$attempt" -eq 1 && "$status" == "failed" ]]; then
+      log "ingress-nginx Helm release is failed after install attempt; uninstalling failed release before retry"
+      helm uninstall "$INGRESS_RELEASE" -n "$INGRESS_NAMESPACE" || true
+      sleep 20
+      continue
+    fi
+
+    die "ingress-nginx Helm install failed; release status is $status"
+  done
+
   run kubectl rollout status -n "$INGRESS_NAMESPACE" deploy/ingress-nginx-controller --timeout=300s
 }
 
@@ -958,50 +990,185 @@ cleanup_leftover_ebs_volumes() {
   done
 }
 
-print_dns_status() {
-  local zone_id current
+status_line() {
+  printf '%-26s %s\n' "$1:" "$2"
+}
+
+get_dns_record() {
+  local zone_id
   zone_id="$(resolve_hosted_zone_id)"
   if [[ -z "$zone_id" || "$zone_id" == "None" ]]; then
-    printf 'DNS record:           unknown (hosted zone %s not found)\n' "$ROUTE53_ZONE_NAME"
+    printf 'unknown'
     return
   fi
 
-  current="$(aws route53 list-resource-record-sets \
+  aws route53 list-resource-record-sets \
     --hosted-zone-id "$zone_id" \
     --query "ResourceRecordSets[?Name=='${HOSTNAME}.' && Type=='CNAME'] | [0].ResourceRecords[0].Value" \
-    --output text)"
+    --output text 2>/dev/null || true
+}
+
+print_dns_status() {
+  local current
+  current="$(get_dns_record)"
   if [[ -z "$current" || "$current" == "None" ]]; then
-    printf 'DNS record:           deleted (%s not present)\n' "$HOSTNAME"
+    status_line "DNS record" "deleted ($HOSTNAME not present)"
+  elif [[ "$current" == "unknown" ]]; then
+    status_line "DNS record" "unknown (hosted zone $ROUTE53_ZONE_NAME not found)"
   else
-    printf 'DNS record:           present (%s -> %s)\n' "$HOSTNAME" "$current"
+    status_line "DNS record" "present ($HOSTNAME -> $current)"
   fi
+}
+
+get_leftover_volumes() {
+  aws ec2 describe-volumes \
+    --region "$AWS_REGION" \
+    --filters "Name=tag:kubernetes.io/cluster/$CLUSTER_NAME,Values=owned" "Name=status,Values=available" \
+    --query 'Volumes[].[VolumeId,State,Size,Tags[?Key==`Name`].Value|[0]]' \
+    --output text 2>/dev/null || true
 }
 
 print_leftover_volume_status() {
   local volumes
-  volumes="$(aws ec2 describe-volumes \
-    --region "$AWS_REGION" \
-    --filters "Name=tag:kubernetes.io/cluster/$CLUSTER_NAME,Values=owned" "Name=status,Values=available,in-use,creating,deleting" \
-    --query 'Volumes[].[VolumeId,State,Size,Tags[?Key==`Name`].Value|[0]]' \
-    --output text)"
-
+  volumes="$(get_leftover_volumes)"
   if [[ -z "$volumes" || "$volumes" == "None" ]]; then
-    printf 'EBS volumes:          none found with cluster-owned tag\n'
+    status_line "EBS volumes" "none found with cluster-owned tag"
   else
-    printf 'EBS volumes:          leftovers found\n'
+    status_line "EBS volumes" "leftovers found"
     printf '%s\n' "$volumes" | sed 's/^/  /'
   fi
+}
+
+pod_health() {
+  local namespace="$1"
+  local rows ready total
+  rows="$(kubectl get pods -n "$namespace" --no-headers 2>/dev/null || true)"
+  if [[ -z "$rows" ]]; then
+    printf 'not found'
+    return
+  fi
+
+  read -r ready total <<< "$(printf '%s\n' "$rows" | awk '
+    NF {
+      total++
+      split($2, containers, "/")
+      if ($3 == "Completed" || $3 == "Succeeded" || (containers[1] == containers[2] && $3 == "Running")) {
+        ready++
+      }
+    }
+    END { printf "%d %d", ready + 0, total + 0 }
+  ')"
+
+  if [[ "$total" -gt 0 && "$ready" -eq "$total" ]]; then
+    printf 'ready (%s/%s pods)' "$ready" "$total"
+  else
+    printf 'warning (%s/%s pods ready)' "$ready" "$total"
+  fi
+}
+
+deployment_health() {
+  local namespace="$1"
+  local deployment="$2"
+  local replicas ready
+  replicas="$(kubectl get deploy "$deployment" -n "$namespace" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+  ready="$(kubectl get deploy "$deployment" -n "$namespace" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+  replicas="${replicas:-0}"
+  ready="${ready:-0}"
+
+  if [[ "$replicas" -gt 0 && "$ready" -eq "$replicas" ]]; then
+    printf 'ready (%s/%s replicas)' "$ready" "$replicas"
+  elif [[ "$replicas" -eq 0 ]]; then
+    printf 'not found'
+  else
+    printf 'warning (%s/%s replicas ready)' "$ready" "$replicas"
+  fi
+}
+
+storage_health() {
+  local addon_status default_class
+  addon_status="$(aws eks describe-addon \
+    --cluster-name "$CLUSTER_NAME" \
+    --addon-name aws-ebs-csi-driver \
+    --region "$AWS_REGION" \
+    --query 'addon.status' \
+    --output text 2>/dev/null || true)"
+  default_class="$(kubectl get storageclass "$POSTGRES_STORAGE_CLASS" -o jsonpath='{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}' 2>/dev/null || true)"
+
+  if [[ "$addon_status" == "ACTIVE" && "$default_class" == "true" ]]; then
+    printf 'ready (EBS CSI active, %s default)' "$POSTGRES_STORAGE_CLASS"
+  elif [[ "$addon_status" == "ACTIVE" ]]; then
+    printf 'warning (EBS CSI active, %s not default)' "$POSTGRES_STORAGE_CLASS"
+  else
+    printf 'warning (EBS CSI add-on %s)' "${addon_status:-not found}"
+  fi
+}
+
+node_health() {
+  local rows ready total node_type
+  rows="$(kubectl get nodes --no-headers 2>/dev/null || true)"
+  if [[ -z "$rows" ]]; then
+    printf 'not found'
+    return
+  fi
+
+  read -r ready total <<< "$(printf '%s\n' "$rows" | awk '
+    NF {
+      total++
+      if ($2 == "Ready") {
+        ready++
+      }
+    }
+    END { printf "%d %d", ready + 0, total + 0 }
+  ')"
+  node_type="$(kubectl get nodes -o jsonpath='{.items[0].metadata.labels.node\.kubernetes\.io/instance-type}' 2>/dev/null || true)"
+
+  if [[ "$ready" -eq "$total" ]]; then
+    printf '%s/%s Ready, type %s' "$ready" "$total" "${node_type:-unknown}"
+  else
+    printf 'warning (%s/%s Ready), type %s' "$ready" "$total" "${node_type:-unknown}"
+  fi
+}
+
+public_url_health() {
+  if curl -k -fsSI --max-time 5 "https://$HOSTNAME/" >/dev/null 2>&1; then
+    printf 'online (https://%s)' "$HOSTNAME"
+  else
+    printf 'not reachable yet (https://%s)' "$HOSTNAME"
+  fi
+}
+
+print_troubleshooting_hints() {
+  printf '\nTroubleshooting:\n'
+  printf '  Detailed pods:      kubectl get pods -A\n'
+  printf '  Ingress details:    kubectl get ingress,svc -n %s\n' "$MODERATOR_NAMESPACE"
+  printf '  App logs:           kubectl logs -n %s deploy/cai-moderator --tail=100\n' "$MODERATOR_NAMESPACE"
+  printf '  Script preflight:   ./scripts/guardrails-poc.sh preflight\n'
+}
+
+print_access_info() {
+  local realm
+  printf '\nAccess\n'
+  printf '======\n'
+  status_line "UI" "https://$HOSTNAME"
+  status_line "Initial username" "$GUARDRAILS_DEFAULT_USERNAME"
+  status_line "Initial password" "$GUARDRAILS_DEFAULT_PASSWORD (until changed)"
+  printf 'Password change:\n'
+  for realm in $GUARDRAILS_AUTH_REALMS; do
+    printf '  Realm %-12s https://%s/auth/realms/%s/account/#/security/signingin\n' "$realm" "$HOSTNAME" "$realm"
+  done
+  printf 'Note: Keycloak passwords are realm-specific. If more than one realm accepts the initial password, change it in each realm.\n'
 }
 
 status_stopped() {
   printf '\nGuardrails PoC status\n'
   printf '=====================\n'
-  printf 'Environment:          stopped\n'
-  printf 'EKS cluster:          not found (%s in %s)\n' "$CLUSTER_NAME" "$AWS_REGION"
+  status_line "Environment" "stopped"
+  status_line "EKS cluster" "not found ($CLUSTER_NAME in $AWS_REGION)"
   print_dns_status
   print_leftover_volume_status
-  printf 'Kubernetes resources: skipped because the EKS cluster is deleted\n'
-  printf 'Public URL:           offline (https://%s)\n' "$HOSTNAME"
+  status_line "Kubernetes" "skipped because the EKS cluster is deleted"
+  status_line "Public URL" "offline (https://$HOSTNAME)"
+  print_access_info
   printf '\nNext actions:\n'
   printf '  Start again:        ./scripts/guardrails-poc.sh up\n'
   printf '  Re-check status:    ./scripts/guardrails-poc.sh status\n'
@@ -1086,17 +1253,58 @@ status() {
 
   aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" >/dev/null
 
-  log "AWS cluster"
-  aws eks describe-cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" --query 'cluster.[name,status,version,endpoint]' --output table || true
-  log "Kubernetes nodes"
-  kubectl get nodes -o wide || true
-  for ns in "$F5_NAMESPACE" "$MODERATOR_NAMESPACE" "$PREFECT_NAMESPACE" "$INFERENCE_NAMESPACE" "$INGRESS_NAMESPACE"; do
-    log "Pods: $ns"
-    kubectl get pods -n "$ns" -o wide || true
-  done
-  log "Ingress"
-  kubectl get ingress -n "$MODERATOR_NAMESPACE" -o wide || true
-  log "URL: https://$HOSTNAME"
+  local cluster_status cluster_version dns_record ingress_lb leftovers public_status
+  cluster_status="$(aws eks describe-cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" --query 'cluster.status' --output text 2>/dev/null || true)"
+  cluster_version="$(aws eks describe-cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" --query 'cluster.version' --output text 2>/dev/null || true)"
+  dns_record="$(get_dns_record)"
+  ingress_lb="$(get_ingress_lb 2>/dev/null || true)"
+  leftovers="$(get_leftover_volumes)"
+  public_status="$(public_url_health)"
+
+  printf '\nGuardrails PoC status\n'
+  printf '=====================\n'
+  status_line "Environment" "running"
+  status_line "Public URL" "$public_status"
+  if [[ -z "$dns_record" || "$dns_record" == "None" ]]; then
+    status_line "DNS" "missing ($HOSTNAME)"
+  elif [[ "$dns_record" == "unknown" ]]; then
+    status_line "DNS" "unknown (hosted zone $ROUTE53_ZONE_NAME not found)"
+  else
+    status_line "DNS" "present -> $dns_record"
+  fi
+  if [[ -n "$ingress_lb" ]]; then
+    status_line "Ingress LB" "ready -> $ingress_lb"
+  else
+    status_line "Ingress LB" "pending"
+  fi
+  status_line "EKS cluster" "${cluster_status:-unknown}, Kubernetes ${cluster_version:-unknown}, region $AWS_REGION"
+  status_line "Node" "$(node_health)"
+  status_line "Storage" "$(storage_health)"
+  status_line "f5-ai-security-operator" "$(deployment_health "$F5_NAMESPACE" controller-manager)"
+  status_line "cai-moderator" "$(pod_health "$MODERATOR_NAMESPACE")"
+  status_line "f5-ai-sec-inference" "$(pod_health "$INFERENCE_NAMESPACE")"
+  status_line "prefect" "$(pod_health "$PREFECT_NAMESPACE")"
+  status_line "ingress-nginx" "$(deployment_health "$INGRESS_NAMESPACE" ingress-nginx-controller)"
+  if [[ -z "$leftovers" || "$leftovers" == "None" ]]; then
+    status_line "EBS leftovers" "none found"
+  else
+    status_line "EBS leftovers" "warning (cluster-tagged volumes found)"
+  fi
+
+  print_access_info
+
+  printf '\nNext actions:\n'
+  if [[ "$public_status" == online* ]]; then
+    printf '  Open UI:           https://%s\n' "$HOSTNAME"
+  else
+    printf '  Complete deploy:   ./scripts/guardrails-poc.sh up\n'
+  fi
+  printf '  Stop PoC:          ./scripts/guardrails-poc.sh down --yes\n'
+  printf '  Re-check status:   ./scripts/guardrails-poc.sh status\n'
+
+  if [[ -z "$ingress_lb" || -z "$dns_record" || "$dns_record" == "None" || "$dns_record" == "unknown" || -n "$leftovers" && "$leftovers" != "None" ]]; then
+    print_troubleshooting_hints
+  fi
 }
 
 load_config
