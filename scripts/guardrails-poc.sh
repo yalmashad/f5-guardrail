@@ -9,6 +9,61 @@ CONFIG_FILE="$DEFAULT_CONFIG"
 DRY_RUN=false
 ASSUME_YES=false
 PREFLIGHT_FAILURES=0
+COLOR_RESET=""
+COLOR_BOLD=""
+COLOR_GREEN=""
+COLOR_YELLOW=""
+COLOR_RED=""
+
+init_colors() {
+  if [[ -n "${NO_COLOR:-}" ]]; then
+    return
+  fi
+
+  if [[ -t 1 || "${FORCE_COLOR:-}" == "1" || "${CLICOLOR_FORCE:-}" == "1" ]]; then
+    COLOR_RESET=$'\033[0m'
+    COLOR_BOLD=$'\033[1m'
+    COLOR_GREEN=$'\033[32m'
+    COLOR_YELLOW=$'\033[33m'
+    COLOR_RED=$'\033[31m'
+  fi
+}
+
+color_text() {
+  local color="$1"
+  shift
+  if [[ -n "$color" ]]; then
+    printf '%s%s%s' "$color" "$*" "$COLOR_RESET"
+  else
+    printf '%s' "$*"
+  fi
+}
+
+color_status_value() {
+  local value="$1"
+  local lower
+  lower="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+
+  case "$lower" in
+    missing*|failed*|error*|not\ found*)
+      color_text "$COLOR_RED" "$value"
+      ;;
+    warning*|pending*|unknown*|stopped*|offline*|deleted*|not\ reachable*)
+      color_text "$COLOR_YELLOW" "$value"
+      ;;
+    ready*|online*|present*|running*|active*|*' ready'*|*' none found'*)
+      color_text "$COLOR_GREEN" "$value"
+      ;;
+    *)
+      printf '%s' "$value"
+      ;;
+  esac
+}
+
+print_heading() {
+  printf '\n%s\n' "$(color_text "$COLOR_BOLD" "$1")"
+  printf '%s\n' "$2"
+}
 
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
@@ -173,16 +228,16 @@ require_tools() {
 }
 
 preflight_ok() {
-  printf '  [OK]   %s\n' "$*"
+  printf '  %s   %s\n' "$(color_text "$COLOR_GREEN" "[OK]")" "$*"
 }
 
 preflight_warn() {
-  printf '  [WARN] %s\n' "$*"
+  printf '  %s %s\n' "$(color_text "$COLOR_YELLOW" "[WARN]")" "$*"
 }
 
 preflight_fail() {
   PREFLIGHT_FAILURES=$((PREFLIGHT_FAILURES + 1))
-  printf '  [FAIL] %s\n' "$*"
+  printf '  %s %s\n' "$(color_text "$COLOR_RED" "[FAIL]")" "$*"
 }
 
 command_version() {
@@ -434,54 +489,53 @@ preflight_up() {
   fi
 
   PREFLIGHT_FAILURES=0
-  printf '\nGuardrails PoC preflight\n'
-  printf '========================\n'
+  print_heading "Guardrails PoC preflight" "========================"
   printf 'Config file:            %s\n' "$CONFIG_FILE"
   printf 'Cluster:                %s (%s)\n' "$CLUSTER_NAME" "$AWS_REGION"
   printf 'Node group:             %s (%s x %s)\n' "$NODEGROUP_NAME" "$NODE_COUNT" "$NODE_TYPE"
   printf 'Hostname:               %s\n' "$HOSTNAME"
-  printf '\nLocal tools\n'
+  printf '\n%s\n' "$(color_text "$COLOR_BOLD" "Local tools")"
   for cmd in aws kubectl helm eksctl openssl python3 curl; do
     check_command "$cmd"
   done
   local tool_failures="$PREFLIGHT_FAILURES"
 
-  printf '\nSecret inputs\n'
+  printf '\n%s\n' "$(color_text "$COLOR_BOLD" "Secret inputs")"
   check_harbor_secret_input
   check_harbor_file_format
   check_secret_file "F5 license" "$F5_LICENSE_FILE" "F5_LICENSE_STRING"
 
   if [[ "$tool_failures" -gt 0 ]]; then
-    printf '\nAWS access\n'
+    printf '\n%s\n' "$(color_text "$COLOR_BOLD" "AWS access")"
     preflight_warn "Skipped because one or more required local tools are missing"
-    printf '\nDeployment validation\n'
+    printf '\n%s\n' "$(color_text "$COLOR_BOLD" "Deployment validation")"
     preflight_warn "Skipped because one or more required local tools are missing"
   else
-    printf '\nAWS access\n'
+    printf '\n%s\n' "$(color_text "$COLOR_BOLD" "AWS access")"
     check_aws_credentials
     check_aws_region
     check_route53_zone
     check_instance_offering
     check_gpu_quota
 
-    printf '\nDeployment validation\n'
+    printf '\n%s\n' "$(color_text "$COLOR_BOLD" "Deployment validation")"
     check_eksctl_cluster_config
     check_harbor_login
     check_license_string
   fi
 
   if [[ "$PREFLIGHT_FAILURES" -gt 0 ]]; then
-    printf '\nPreflight failed with %s issue(s). Fix the items marked [FAIL], then rerun:\n' "$PREFLIGHT_FAILURES"
+    printf '\n%s\n' "$(color_text "$COLOR_RED" "Preflight failed with $PREFLIGHT_FAILURES issue(s). Fix the items marked [FAIL], then rerun:")"
     printf '  ./scripts/guardrails-poc.sh preflight\n\n'
     exit 1
   fi
 
   if [[ "$mode" == "check" ]]; then
-    printf '\nPreflight passed. The environment is ready to deploy.\n'
+    printf '\n%s\n' "$(color_text "$COLOR_GREEN" "Preflight passed. The environment is ready to deploy.")"
     printf 'Start deployment with:\n'
     printf '  ./scripts/guardrails-poc.sh up\n\n'
   else
-    printf '\nPreflight passed. Starting deployment.\n\n'
+    printf '\n%s\n\n' "$(color_text "$COLOR_GREEN" "Preflight passed. Starting deployment.")"
   fi
 }
 
@@ -991,7 +1045,7 @@ cleanup_leftover_ebs_volumes() {
 }
 
 status_line() {
-  printf '%-26s %s\n' "$1:" "$2"
+  printf '%-26s %s\n' "$1:" "$(color_status_value "$2")"
 }
 
 get_dns_record() {
@@ -1138,7 +1192,7 @@ public_url_health() {
 }
 
 print_troubleshooting_hints() {
-  printf '\nTroubleshooting:\n'
+  printf '\n%s\n' "$(color_text "$COLOR_BOLD" "Troubleshooting")"
   printf '  Detailed pods:      kubectl get pods -A\n'
   printf '  Ingress details:    kubectl get ingress,svc -n %s\n' "$MODERATOR_NAMESPACE"
   printf '  App logs:           kubectl logs -n %s deploy/cai-moderator --tail=100\n' "$MODERATOR_NAMESPACE"
@@ -1147,8 +1201,7 @@ print_troubleshooting_hints() {
 
 print_access_info() {
   local realm
-  printf '\nAccess\n'
-  printf '======\n'
+  print_heading "Access" "======"
   status_line "UI" "https://$HOSTNAME"
   status_line "Initial username" "$GUARDRAILS_DEFAULT_USERNAME"
   status_line "Initial password" "$GUARDRAILS_DEFAULT_PASSWORD (until changed)"
@@ -1160,8 +1213,7 @@ print_access_info() {
 }
 
 status_stopped() {
-  printf '\nGuardrails PoC status\n'
-  printf '=====================\n'
+  print_heading "Guardrails PoC status" "====================="
   status_line "Environment" "stopped"
   status_line "EKS cluster" "not found ($CLUSTER_NAME in $AWS_REGION)"
   print_dns_status
@@ -1261,8 +1313,7 @@ status() {
   leftovers="$(get_leftover_volumes)"
   public_status="$(public_url_health)"
 
-  printf '\nGuardrails PoC status\n'
-  printf '=====================\n'
+  print_heading "Guardrails PoC status" "====================="
   status_line "Environment" "running"
   status_line "Public URL" "$public_status"
   if [[ -z "$dns_record" || "$dns_record" == "None" ]]; then
@@ -1308,6 +1359,7 @@ status() {
 }
 
 load_config
+init_colors
 
 case "$ACTION" in
   preflight) do_preflight ;;
