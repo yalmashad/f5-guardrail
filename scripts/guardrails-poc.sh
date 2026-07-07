@@ -51,8 +51,11 @@ color_status_value() {
     warning*|pending*|unknown*|stopped*|offline*|deleted*|not\ reachable*)
       color_text "$COLOR_YELLOW" "$value"
       ;;
-    ready*|online*|present*|running*|active*|*' ready'*|*' none found'*)
+    ready*|online*|present*|running*|active*|enabled*|*' ready'*|*' none found'*)
       color_text "$COLOR_GREEN" "$value"
+      ;;
+    disabled*)
+      color_text "$COLOR_YELLOW" "$value"
       ;;
     *)
       printf '%s' "$value"
@@ -157,11 +160,13 @@ load_config() {
   NODE_AMI_FAMILY="${NODE_AMI_FAMILY:-AmazonLinux2023}"
   VPC_NAT_MODE="${VPC_NAT_MODE:-Disable}"
   HOSTNAME="${HOSTNAME:-guardrails.f5demo.io}"
+  ROUTE53_ENABLED="${ROUTE53_ENABLED:-false}"
   ROUTE53_ZONE_NAME="${ROUTE53_ZONE_NAME:-${HOSTNAME#*.}}"
   ROUTE53_HOSTED_ZONE_ID="${ROUTE53_HOSTED_ZONE_ID:-}"
   GUARDRAILS_DEFAULT_USERNAME="${GUARDRAILS_DEFAULT_USERNAME:-admin}"
   GUARDRAILS_DEFAULT_PASSWORD="${GUARDRAILS_DEFAULT_PASSWORD:-pass}"
   GUARDRAILS_AUTH_REALMS="${GUARDRAILS_AUTH_REALMS:-master calypsoai}"
+  GUARDRAILS_ENABLE_RED_TEAM="${GUARDRAILS_ENABLE_RED_TEAM:-false}"
   HARBOR_REGISTRY="${HARBOR_REGISTRY:-harbor.calypsoai.app}"
   HARBOR_CREDENTIALS_FILE="${HARBOR_CREDENTIALS_FILE:-}"
   F5_LICENSE_FILE="${F5_LICENSE_FILE:-}"
@@ -169,14 +174,16 @@ load_config() {
   MODERATOR_NAMESPACE="${MODERATOR_NAMESPACE:-cai-moderator}"
   PREFECT_NAMESPACE="${PREFECT_NAMESPACE:-prefect}"
   INFERENCE_NAMESPACE="${INFERENCE_NAMESPACE:-f5-ai-sec-inference}"
-  INGRESS_NAMESPACE="${INGRESS_NAMESPACE:-ingress-nginx}"
+  INGRESS_NAMESPACE="${INGRESS_NAMESPACE:-nginx-ingress}"
   OPERATOR_RELEASE="${OPERATOR_RELEASE:-f5-ai-security-operator}"
   OPERATOR_CHART="${OPERATOR_CHART:-oci://harbor.calypsoai.app/calypsoai/f5-ai-security-operator-helm}"
   OPERATOR_CHART_VERSION="${OPERATOR_CHART_VERSION:-1.4.1}"
-  INGRESS_RELEASE="${INGRESS_RELEASE:-ingress-nginx}"
-  INGRESS_CHART="${INGRESS_CHART:-ingress-nginx/ingress-nginx}"
-  INGRESS_REPO_NAME="${INGRESS_REPO_NAME:-ingress-nginx}"
-  INGRESS_REPO_URL="${INGRESS_REPO_URL:-https://kubernetes.github.io/ingress-nginx}"
+  INGRESS_RELEASE="${INGRESS_RELEASE:-nginx-ingress}"
+  INGRESS_CHART="${INGRESS_CHART:-nginx-stable/nginx-ingress}"
+  INGRESS_REPO_NAME="${INGRESS_REPO_NAME:-nginx-stable}"
+  INGRESS_REPO_URL="${INGRESS_REPO_URL:-https://helm.nginx.com/stable}"
+  INGRESS_CONTROLLER_SERVICE="${INGRESS_CONTROLLER_SERVICE:-nginx-ingress-controller}"
+  INGRESS_CONTROLLER_DEPLOYMENT="${INGRESS_CONTROLLER_DEPLOYMENT:-nginx-ingress-controller}"
   SECURITY_OPERATOR_NAME="${SECURITY_OPERATOR_NAME:-security-operator-demo}"
   POSTGRES_STORAGE_CLASS="${POSTGRES_STORAGE_CLASS:-gp2}"
   POSTGRES_PASSWORD_FILE="${POSTGRES_PASSWORD_FILE:-.secrets/postgres-password}"
@@ -351,6 +358,11 @@ check_aws_region() {
 }
 
 check_route53_zone() {
+  if [[ "$ROUTE53_ENABLED" != "true" ]]; then
+    preflight_ok "Route 53 management disabled; skipping hosted zone lookup"
+    return
+  fi
+
   local zone_id
   if ! zone_id="$(resolve_hosted_zone_id 2>/dev/null)"; then
     preflight_fail "Unable to query Route 53 hosted zone for $ROUTE53_ZONE_NAME"
@@ -494,6 +506,8 @@ preflight_up() {
   printf 'Cluster:                %s (%s)\n' "$CLUSTER_NAME" "$AWS_REGION"
   printf 'Node group:             %s (%s x %s)\n' "$NODEGROUP_NAME" "$NODE_COUNT" "$NODE_TYPE"
   printf 'Hostname:               %s\n' "$HOSTNAME"
+  printf 'Route 53 managed:       %s\n' "$ROUTE53_ENABLED"
+  printf 'Red Team enabled:       %s\n' "$GUARDRAILS_ENABLE_RED_TEAM"
   printf '\n%s\n' "$(color_text "$COLOR_BOLD" "Local tools")"
   for cmd in aws kubectl helm eksctl openssl python3 curl; do
     check_command "$cmd"
@@ -706,8 +720,10 @@ install_operator() {
 
 apply_security_operator() {
   if [[ "$DRY_RUN" == true ]]; then
+    local red_team_label="disabled"
+    [[ "$GUARDRAILS_ENABLE_RED_TEAM" == "true" ]] && red_team_label="enabled"
     printf '+ kubectl apply -f <SecurityOperator manifest for %s>\n' "$SECURITY_OPERATOR_NAME"
-    printf '  SecurityOperator manifest: Guardrails enabled, Red Team disabled, in-cluster PostgreSQL enabled, CAI_MODERATOR_BASE_URL=https://%s\n' "$HOSTNAME"
+    printf '  SecurityOperator manifest: Guardrails enabled, Red Team %s, in-cluster PostgreSQL enabled, CAI_MODERATOR_BASE_URL=https://%s\n' "$red_team_label" "$HOSTNAME"
     return
   fi
 
@@ -721,6 +737,7 @@ apply_security_operator() {
   HOSTNAME="$HOSTNAME" \
   POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   F5_LICENSE_STRING="$F5_LICENSE_STRING" \
+  GUARDRAILS_ENABLE_RED_TEAM="$GUARDRAILS_ENABLE_RED_TEAM" \
   python3 - <<'PY'
 import os
 from pathlib import Path
@@ -756,7 +773,7 @@ spec:
         guardrails:
           enabled: true
         redteam:
-          enabled: false
+          enabled: {os.environ['GUARDRAILS_ENABLE_RED_TEAM'].lower()}
 """
 Path(os.environ["MANIFEST_PATH"]).write_text(manifest, encoding="utf-8")
 PY
@@ -811,8 +828,8 @@ install_ingress() {
   run helm repo update "$INGRESS_REPO_NAME"
 
   if [[ "$DRY_RUN" == true ]]; then
-    run helm upgrade --install "$INGRESS_RELEASE" "$INGRESS_CHART" --namespace "$INGRESS_NAMESPACE" --create-namespace --set 'controller.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type=nlb' --set 'controller.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing' --set controller.service.externalTrafficPolicy=Local
-    run kubectl rollout status -n "$INGRESS_NAMESPACE" deploy/ingress-nginx-controller --timeout=300s
+    run helm upgrade --install "$INGRESS_RELEASE" "$INGRESS_CHART" --namespace "$INGRESS_NAMESPACE" --create-namespace --set-string 'controller.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type=nlb' --set-string 'controller.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing' --set controller.service.externalTrafficPolicy=Local
+    run kubectl rollout status -n "$INGRESS_NAMESPACE" deploy/"$INGRESS_CONTROLLER_DEPLOYMENT" --timeout=300s
     return
   fi
 
@@ -822,24 +839,24 @@ install_ingress() {
     if helm upgrade --install "$INGRESS_RELEASE" "$INGRESS_CHART" \
       --namespace "$INGRESS_NAMESPACE" \
       --create-namespace \
-      --set 'controller.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type=nlb' \
-      --set 'controller.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing' \
+      --set-string 'controller.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type=nlb' \
+      --set-string 'controller.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing' \
       --set controller.service.externalTrafficPolicy=Local; then
       break
     fi
 
     status="$(helm status "$INGRESS_RELEASE" -n "$INGRESS_NAMESPACE" -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("info", {}).get("status", "unknown"))' 2>/dev/null || printf 'not-found')"
     if [[ "$attempt" -eq 1 && "$status" == "failed" ]]; then
-      log "ingress-nginx Helm release is failed after install attempt; uninstalling failed release before retry"
+      log "Ingress controller Helm release is failed after install attempt; uninstalling failed release before retry"
       helm uninstall "$INGRESS_RELEASE" -n "$INGRESS_NAMESPACE" || true
       sleep 20
       continue
     fi
 
-    die "ingress-nginx Helm install failed; release status is $status"
+    die "Ingress controller Helm install failed; release status is $status"
   done
 
-  run kubectl rollout status -n "$INGRESS_NAMESPACE" deploy/ingress-nginx-controller --timeout=300s
+  run kubectl rollout status -n "$INGRESS_NAMESPACE" deploy/"$INGRESS_CONTROLLER_DEPLOYMENT" --timeout=300s
 }
 
 create_tls_secret() {
@@ -885,10 +902,9 @@ metadata:
   name: cai-moderator-ingress
   namespace: $MODERATOR_NAMESPACE
   annotations:
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.org/proxy-read-timeout: "3600s"
+    nginx.org/proxy-send-timeout: "3600s"
+    nginx.org/ssl-redirect: "true"
 spec:
   ingressClassName: nginx
   tls:
@@ -919,16 +935,16 @@ YAML
 }
 
 get_ingress_lb() {
-  kubectl get svc -n "$INGRESS_NAMESPACE" ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+  kubectl get svc -n "$INGRESS_NAMESPACE" "$INGRESS_CONTROLLER_SERVICE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
 }
 
 wait_for_ingress_lb() {
   if [[ "$DRY_RUN" == true ]]; then
-    printf '+ wait for ingress-nginx load balancer hostname\n'
+    printf '+ wait for ingress controller load balancer hostname\n'
     return
   fi
 
-  log "Waiting for ingress-nginx load balancer hostname"
+  log "Waiting for ingress controller load balancer hostname"
   local lb=""
   for _ in {1..60}; do
     lb="$(get_ingress_lb || true)"
@@ -938,13 +954,22 @@ wait_for_ingress_lb() {
     fi
     sleep 10
   done
-  die "Timed out waiting for ingress-nginx load balancer hostname"
+  die "Timed out waiting for ingress controller load balancer hostname"
 }
 
 route53_upsert() {
   local lb="$1"
+  if [[ "$ROUTE53_ENABLED" != "true" ]]; then
+    if [[ "$DRY_RUN" == true ]]; then
+      printf '+ skip Route 53 UPSERT for %s because ROUTE53_ENABLED=false\n' "$HOSTNAME"
+    else
+      log "Route 53 management disabled; skipping DNS upsert for $HOSTNAME"
+    fi
+    return
+  fi
+
   if [[ "$DRY_RUN" == true ]]; then
-    printf '+ route53 UPSERT %s -> <ingress-nginx-load-balancer>\n' "$HOSTNAME"
+    printf '+ route53 UPSERT %s -> <ingress-load-balancer>\n' "$HOSTNAME"
     return
   fi
 
@@ -955,7 +980,7 @@ route53_upsert() {
   HOSTNAME="$HOSTNAME" LB_HOSTNAME="$lb" python3 - "$change_file" <<'PY'
 import json, os, sys
 change = {
-    "Comment": "Point Guardrails PoC hostname to ingress-nginx load balancer",
+    "Comment": "Point Guardrails PoC hostname to ingress load balancer",
     "Changes": [{
         "Action": "UPSERT",
         "ResourceRecordSet": {
@@ -974,6 +999,15 @@ PY
 }
 
 route53_delete() {
+  if [[ "$ROUTE53_ENABLED" != "true" ]]; then
+    if [[ "$DRY_RUN" == true ]]; then
+      printf '+ skip Route 53 DELETE for %s because ROUTE53_ENABLED=false\n' "$HOSTNAME"
+    else
+      log "Route 53 management disabled; skipping DNS delete for $HOSTNAME"
+    fi
+    return
+  fi
+
   if [[ "$DRY_RUN" == true ]]; then
     printf '+ route53 DELETE %s\n' "$HOSTNAME"
     return
@@ -1049,6 +1083,11 @@ status_line() {
 }
 
 get_dns_record() {
+  if [[ "$ROUTE53_ENABLED" != "true" ]]; then
+    printf 'disabled'
+    return
+  fi
+
   local zone_id
   zone_id="$(resolve_hosted_zone_id)"
   if [[ -z "$zone_id" || "$zone_id" == "None" ]]; then
@@ -1067,6 +1106,8 @@ print_dns_status() {
   current="$(get_dns_record)"
   if [[ -z "$current" || "$current" == "None" ]]; then
     status_line "DNS record" "deleted ($HOSTNAME not present)"
+  elif [[ "$current" == "disabled" ]]; then
+    status_line "DNS record" "disabled (Route 53 not managed by script)"
   elif [[ "$current" == "unknown" ]]; then
     status_line "DNS record" "unknown (hosted zone $ROUTE53_ZONE_NAME not found)"
   else
@@ -1184,6 +1225,11 @@ node_health() {
 }
 
 public_url_health() {
+  if [[ "$ROUTE53_ENABLED" != "true" ]]; then
+    printf 'not verified (DNS not managed by script)'
+    return
+  fi
+
   if curl -k -fsSI --max-time 5 "https://$HOSTNAME/" >/dev/null 2>&1; then
     printf 'online (https://%s)' "$HOSTNAME"
   else
@@ -1227,6 +1273,15 @@ status_stopped() {
 }
 
 verify_public_url() {
+  if [[ "$ROUTE53_ENABLED" != "true" ]]; then
+    if [[ "$DRY_RUN" == true ]]; then
+      printf '+ skip public URL verification because ROUTE53_ENABLED=false\n'
+    else
+      log "Route 53 management disabled; skipping public URL verification for https://$HOSTNAME"
+    fi
+    return
+  fi
+
   if [[ "$DRY_RUN" == true ]]; then
     run curl -k -I --max-time 20 "https://$HOSTNAME/"
     run curl -k -I --max-time 20 "https://$HOSTNAME/auth/"
@@ -1318,6 +1373,8 @@ status() {
   status_line "Public URL" "$public_status"
   if [[ -z "$dns_record" || "$dns_record" == "None" ]]; then
     status_line "DNS" "missing ($HOSTNAME)"
+  elif [[ "$dns_record" == "disabled" ]]; then
+    status_line "DNS" "disabled (set ROUTE53_ENABLED=true to manage Route 53)"
   elif [[ "$dns_record" == "unknown" ]]; then
     status_line "DNS" "unknown (hosted zone $ROUTE53_ZONE_NAME not found)"
   else
@@ -1334,8 +1391,13 @@ status() {
   status_line "f5-ai-security-operator" "$(deployment_health "$F5_NAMESPACE" controller-manager)"
   status_line "cai-moderator" "$(pod_health "$MODERATOR_NAMESPACE")"
   status_line "f5-ai-sec-inference" "$(pod_health "$INFERENCE_NAMESPACE")"
+  if [[ "$GUARDRAILS_ENABLE_RED_TEAM" == "true" ]]; then
+    status_line "Red Team" "enabled"
+  else
+    status_line "Red Team" "disabled"
+  fi
   status_line "prefect" "$(pod_health "$PREFECT_NAMESPACE")"
-  status_line "ingress-nginx" "$(deployment_health "$INGRESS_NAMESPACE" ingress-nginx-controller)"
+  status_line "$INGRESS_NAMESPACE" "$(deployment_health "$INGRESS_NAMESPACE" "$INGRESS_CONTROLLER_DEPLOYMENT")"
   if [[ -z "$leftovers" || "$leftovers" == "None" ]]; then
     status_line "EBS leftovers" "none found"
   else

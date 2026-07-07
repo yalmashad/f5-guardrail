@@ -7,10 +7,10 @@ The PoC uses:
 - Amazon EKS with one GPU managed node group
 - F5 AI Security Operator installed from Harbor
 - Guardrails inference enabled
-- Red Team disabled
+- Red Team optional and disabled by default
 - In-cluster PostgreSQL
-- NGINX Ingress Controller
-- Route 53 DNS
+- F5 NGINX Ingress Controller for NGINX Open Source
+- Optional Route 53 DNS management
 - Self-signed TLS for lab access
 
 > This is a PoC, not a production reference architecture. Do not commit real Harbor credentials, license strings, passwords, or generated secrets.
@@ -22,7 +22,7 @@ Browser
   |
   | https://guardrails.f5demo.io
   v
-Route 53 CNAME
+DNS record
   |
   v
 AWS Network Load Balancer
@@ -43,7 +43,7 @@ NGINX Ingress Controller
 | `cai-moderator` | Guardrails UI/API, Keycloak auth, PostgreSQL |
 | `prefect` | Prefect server, worker, workflow registration |
 | `f5-ai-sec-inference` | Guardrails inference service and scanner model |
-| `ingress-nginx` | Public ingress controller and AWS load balancer |
+| `nginx-ingress` | F5 NGINX Ingress Controller and AWS load balancer |
 
 ## Sizing Note
 
@@ -53,7 +53,12 @@ The F5 runbook recommends more headroom for single-node deployments. This PoC us
 - 16 vCPU
 - 64 GiB memory
 
-If pods remain Pending, are OOMKilled, or model loading becomes unstable, resize to `g5.8xlarge`.
+For Guardrails only, `g5.4xlarge` worked in this PoC. For Guardrails and Red Team together, the F5 runbook calls for dedicated GPUs per product:
+
+- Guardrails: 1 GPU with at least 24 GB VRAM
+- Red Team: 1 GPU with at least 48 GB VRAM
+
+That means both products together need two GPUs. On AWS, use an instance family/size that presents at least two suitable GPUs and enough CPU/memory headroom, such as an A10G multi-GPU size for PoC testing or an A100/H100 class node where available. A single-GPU `g5.4xlarge` is not enough for both Guardrails and Red Team.
 
 ## Prerequisites and Preflight
 
@@ -72,7 +77,7 @@ Required local tools:
 Required inputs:
 
 - AWS CLI credentials with permissions for EKS, EC2, IAM, CloudFormation, ELB, EBS, and Route 53
-- Route 53 hosted zone for the selected hostname
+- Route 53 hosted zone for the selected hostname, only if `ROUTE53_ENABLED=true`
 - Harbor registry credentials for `harbor.calypsoai.app`
 - F5 AI Security license string
 - LLM provider credentials for post-install app configuration
@@ -92,7 +97,7 @@ Run preflight:
 ./scripts/guardrails-poc.sh preflight
 ```
 
-The preflight check validates local tools, AWS identity, region, Route 53, GPU instance availability, GPU quota visibility, Harbor login, license input, and `eksctl` cluster configuration.
+The preflight check validates local tools, AWS identity, region, optional Route 53 settings, GPU instance availability, GPU quota visibility, Harbor login, license input, and `eksctl` cluster configuration.
 
 ## Script Deployment
 
@@ -115,7 +120,7 @@ Copy the example config:
 cp config/guardrails-poc.env.example config/guardrails-poc.env
 ```
 
-Edit `config/guardrails-poc.env` if you need to change region, cluster name, hostname, hosted zone, instance type, or secret file paths.
+Edit `config/guardrails-poc.env` if you need to change region, cluster name, hostname, hosted zone, instance type, Red Team, Route 53, ingress, or secret file paths.
 
 Default secret paths:
 
@@ -123,6 +128,17 @@ Default secret paths:
 HARBOR_CREDENTIALS_FILE="config/harbor.txt"
 F5_LICENSE_FILE="config/license.txt"
 ```
+
+Important feature toggles:
+
+```bash
+ROUTE53_ENABLED="false"
+GUARDRAILS_ENABLE_RED_TEAM="false"
+```
+
+When Route 53 is disabled, the script still creates the ingress load balancer and prints its hostname. You can then create DNS manually with any DNS provider. Set `ROUTE53_ENABLED=true` to let the script honor `ROUTE53_ZONE_NAME` and `ROUTE53_HOSTED_ZONE_ID`.
+
+When Red Team is enabled, make sure the license covers Red Team and the node group has enough dedicated GPU capacity.
 
 Relative paths are resolved from the repository root.
 
@@ -174,7 +190,8 @@ f5-ai-security-operator:   ready (1/1 replicas)
 cai-moderator:             ready (2/2 pods)
 f5-ai-sec-inference:       ready (2/2 pods)
 prefect:                   ready (3/3 pods)
-ingress-nginx:             ready (1/1 replicas)
+Red Team:                  disabled
+nginx-ingress:             ready (1/1 replicas)
 EBS leftovers:             none found
 ```
 
@@ -184,7 +201,7 @@ EBS leftovers:             none found
 ./scripts/guardrails-poc.sh down --yes
 ```
 
-This deletes Route 53 records, the EKS cluster, GPU node group, load balancer, EBS volumes created through the cluster, available leftover cluster-owned EBS volumes, and `eksctl` CloudFormation stacks.
+This deletes Route 53 records when enabled, the EKS cluster, GPU node group, load balancer, EBS volumes created through the cluster, available leftover cluster-owned EBS volumes, and `eksctl` CloudFormation stacks.
 
 This delete-and-recreate model is slower than scaling a node group to zero, but it removes EKS control-plane and GPU-node cost.
 
@@ -275,24 +292,24 @@ helm upgrade --install f5-ai-security-operator \
   -n f5-ai-sec
 ```
 
-Apply a Guardrails-only `SecurityOperator` custom resource with:
+Apply a `SecurityOperator` custom resource with:
 
 - `registryAuth.existingSecret: regcred`
 - in-cluster PostgreSQL enabled
 - `CAI_MODERATOR_BASE_URL` set to `https://guardrails.f5demo.io`
 - `CAI_MODERATOR_DEFAULT_LICENSE` set to your F5 license string
 - Guardrails inference enabled
-- Red Team disabled
+- Red Team enabled only if your license and GPU capacity support it
 
 ### 4. Complete Supporting Services
 
 The first manual deployment required these fixes, which are now automated by the script:
 
 - Wait for Prefect API health before recreating the workflow registration job.
-- Install ingress-nginx with an internet-facing AWS NLB.
+- Install F5 NGINX Ingress Controller with an internet-facing AWS NLB.
 - Create a self-signed TLS secret for `guardrails.f5demo.io`.
 - Create an ingress routing `/auth` to port `8080` and `/` to port `5500` on `cai-moderator`.
-- Create a Route 53 CNAME from `guardrails.f5demo.io` to the ingress-nginx load balancer.
+- Optionally create a Route 53 CNAME from `guardrails.f5demo.io` to the ingress load balancer.
 
 ## Troubleshooting
 
@@ -306,7 +323,7 @@ Useful detailed commands:
 
 ```bash
 kubectl get pods -A
-kubectl get svc -n ingress-nginx ingress-nginx-controller -o wide
+kubectl get svc -n nginx-ingress nginx-ingress-controller -o wide
 kubectl get ingress -n cai-moderator -o wide
 kubectl logs -n cai-moderator deploy/cai-moderator --tail=100
 kubectl logs -n f5-ai-sec deploy/controller-manager --tail=100
@@ -314,7 +331,7 @@ kubectl logs -n f5-ai-sec-inference deploy/f5-ai-sec-inference --tail=100
 kubectl logs -n prefect deploy/prefect-server --tail=100
 ```
 
-If the public URL is not reachable immediately after Route 53 is updated, wait a few minutes for DNS propagation and local resolver cache refresh.
+If Route 53 is enabled and the public URL is not reachable immediately after the record is updated, wait a few minutes for DNS propagation and local resolver cache refresh. If Route 53 is disabled, create a DNS record manually that points your hostname to the ingress load balancer.
 
 ## Production Considerations
 
