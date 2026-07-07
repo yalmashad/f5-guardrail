@@ -1,10 +1,11 @@
 # F5 AI Security on Amazon EKS
 
-This repository automates a single-node Amazon EKS proof of concept for F5 AI Security Guardrails.
+This repository automates an Amazon EKS proof of concept for F5 AI Security Guardrails, with optional Red Team.
 
 The PoC uses:
 
-- Amazon EKS with one GPU managed node group
+- Amazon EKS with one Guardrails GPU managed node group
+- Optional second GPU managed node group for Red Team
 - F5 AI Security Operator installed from Harbor
 - Guardrails inference enabled
 - Red Team optional and disabled by default
@@ -47,7 +48,7 @@ NGINX Ingress Controller
 
 ## Sizing Note
 
-The F5 runbook recommends more headroom for single-node deployments. This PoC uses `g5.4xlarge` as the smallest practical AWS GPU instance because it provides:
+The F5 runbook recommends more headroom for single-node deployments. For Guardrails only, this PoC uses `g5.4xlarge` as the smallest practical AWS GPU instance because it provides:
 
 - 1 NVIDIA A10G GPU with 24 GiB VRAM
 - 16 vCPU
@@ -58,7 +59,7 @@ For Guardrails only, `g5.4xlarge` worked in this PoC. For Guardrails and Red Tea
 - Guardrails: 1 GPU with at least 24 GB VRAM
 - Red Team: 1 GPU with at least 48 GB VRAM
 
-That means both products together need two GPUs. On AWS, use an instance family/size that presents at least two suitable GPUs and enough CPU/memory headroom, such as an A10G multi-GPU size for PoC testing or an A100/H100 class node where available. A single-GPU `g5.4xlarge` is not enough for both Guardrails and Red Team.
+That means both products together need two GPUs. This script keeps cost lower by using two managed node groups when Red Team is enabled: `g5.4xlarge` for Guardrails and `g6e.2xlarge` for Red Team. The F5 operator image includes the inference chart, where Guardrails uses KubeAI resource profile `nvidia-gpu-a10g:1` and Red Team uses `nvidia-gpu-l40s:1`. The script adds node selectors to those KubeAI resource profiles so each model lands on the intended EKS managed node group.
 
 ## Prerequisites and Preflight
 
@@ -117,7 +118,7 @@ Copy the example config:
 cp config/guardrails-poc.env.example config/guardrails-poc.env
 ```
 
-Edit `config/guardrails-poc.env` if you need to change region, cluster name, hostname, hosted zone, instance type, Red Team, Route 53, ingress, or secret file paths.
+Edit `config/guardrails-poc.env` if you need to change region, cluster name, hostname, hosted zone, node groups, Red Team, Route 53, ingress, or secret file paths.
 
 Default secret paths:
 
@@ -135,7 +136,15 @@ ENABLE_RED_TEAM="false"
 
 When Route 53 is disabled, the script still creates the ingress load balancer and prints its hostname. You can then create DNS manually with any DNS provider. Set `ROUTE53_ENABLED=true` to let the script honor `ROUTE53_ZONE_NAME` and `ROUTE53_HOSTED_ZONE_ID`.
 
-When Red Team is enabled, make sure the license covers Red Team and the node group has enough dedicated GPU capacity.
+When Red Team is enabled, make sure the license covers Red Team. Default node groups:
+
+```bash
+GUARDRAIL_NODEGROUP_NAME="guardrails-gpu-ng"
+GUARDRAIL_NODE_TYPE="g5.4xlarge"
+
+RED_TEAM_NODEGROUP_NAME="redteam-gpu-ng"
+RED_TEAM_NODE_TYPE="g6e.2xlarge"
+```
 
 Relative paths are resolved from the repository root.
 
@@ -166,6 +175,7 @@ DNS:                       present -> <load-balancer>
 Ingress LB:                ready -> <load-balancer>
 EKS cluster:               ACTIVE, Kubernetes 1.35, region us-east-1
 Node:                      1/1 Ready, type g5.4xlarge
+Guardrails node group:     ACTIVE, 1 desired (1-1), type g5.4xlarge
 Storage:                   ready (EBS CSI active, gp2 default)
 f5-ai-security-operator:   ready (1/1 replicas)
 cai-moderator:             ready (2/2 pods)
@@ -232,6 +242,23 @@ eksctl create cluster \
   --vpc-nat-mode Disable
 ```
 
+If Red Team is enabled, add a second managed GPU node group:
+
+```bash
+eksctl create nodegroup \
+  --cluster f5-guardrails-poc \
+  --region us-east-1 \
+  --name redteam-gpu-ng \
+  --node-type g6e.2xlarge \
+  --nodes 1 \
+  --nodes-min 1 \
+  --nodes-max 1 \
+  --node-volume-size 150 \
+  --node-ami-family AmazonLinux2023 \
+  --managed \
+  --install-nvidia-plugin
+```
+
 ### 2. Prepare Storage
 
 ```bash
@@ -279,6 +306,7 @@ Apply a `SecurityOperator` custom resource with:
 - `CAI_MODERATOR_DEFAULT_LICENSE` set to your F5 license string
 - Guardrails inference enabled
 - Red Team enabled only if your license and GPU capacity support it
+- KubeAI resource profile node selectors for `nvidia-gpu-a10g` and, when enabled, `nvidia-gpu-l40s`
 
 ### 4. Complete Supporting Services
 

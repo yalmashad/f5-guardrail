@@ -151,12 +151,12 @@ load_config() {
   AWS_REGION="${AWS_REGION:-us-east-1}"
   CLUSTER_NAME="${CLUSTER_NAME:-f5-guardrails-poc}"
   K8S_VERSION="${K8S_VERSION:-1.35}"
-  NODEGROUP_NAME="${NODEGROUP_NAME:-guardrails-gpu-ng}"
-  NODE_TYPE="${NODE_TYPE:-g5.4xlarge}"
-  NODE_COUNT="${NODE_COUNT:-1}"
-  NODE_MIN="${NODE_MIN:-1}"
-  NODE_MAX="${NODE_MAX:-1}"
-  NODE_VOLUME_SIZE="${NODE_VOLUME_SIZE:-150}"
+  GUARDRAIL_NODEGROUP_NAME="${GUARDRAIL_NODEGROUP_NAME:-guardrails-gpu-ng}"
+  GUARDRAIL_NODE_TYPE="${GUARDRAIL_NODE_TYPE:-g5.4xlarge}"
+  GUARDRAIL_NODE_COUNT="${GUARDRAIL_NODE_COUNT:-1}"
+  GUARDRAIL_NODE_MIN="${GUARDRAIL_NODE_MIN:-1}"
+  GUARDRAIL_NODE_MAX="${GUARDRAIL_NODE_MAX:-1}"
+  GUARDRAIL_NODE_VOLUME_SIZE="${GUARDRAIL_NODE_VOLUME_SIZE:-150}"
   NODE_AMI_FAMILY="${NODE_AMI_FAMILY:-AmazonLinux2023}"
   VPC_NAT_MODE="${VPC_NAT_MODE:-Disable}"
   HOSTNAME="${HOSTNAME:-guardrails.f5demo.io}"
@@ -167,6 +167,12 @@ load_config() {
   GUARDRAILS_DEFAULT_PASSWORD="${GUARDRAILS_DEFAULT_PASSWORD:-pass}"
   GUARDRAILS_AUTH_REALMS="${GUARDRAILS_AUTH_REALMS:-master calypsoai}"
   ENABLE_RED_TEAM="${ENABLE_RED_TEAM:-false}"
+  RED_TEAM_NODEGROUP_NAME="${RED_TEAM_NODEGROUP_NAME:-redteam-gpu-ng}"
+  RED_TEAM_NODE_TYPE="${RED_TEAM_NODE_TYPE:-g6e.2xlarge}"
+  RED_TEAM_NODE_COUNT="${RED_TEAM_NODE_COUNT:-1}"
+  RED_TEAM_NODE_MIN="${RED_TEAM_NODE_MIN:-1}"
+  RED_TEAM_NODE_MAX="${RED_TEAM_NODE_MAX:-1}"
+  RED_TEAM_NODE_VOLUME_SIZE="${RED_TEAM_NODE_VOLUME_SIZE:-150}"
   HARBOR_REGISTRY="${HARBOR_REGISTRY:-harbor.calypsoai.app}"
   HARBOR_CREDENTIALS_FILE="${HARBOR_CREDENTIALS_FILE:-}"
   F5_LICENSE_FILE="${F5_LICENSE_FILE:-}"
@@ -376,18 +382,27 @@ check_route53_zone() {
   fi
 }
 
-check_instance_offering() {
+check_instance_offering_for() {
+  local label="$1"
+  local instance_type="$2"
   local count
   count="$(aws ec2 describe-instance-type-offerings \
     --region "$AWS_REGION" \
     --location-type availability-zone \
-    --filters "Name=instance-type,Values=$NODE_TYPE" \
+    --filters "Name=instance-type,Values=$instance_type" \
     --query 'length(InstanceTypeOfferings)' \
     --output text 2>/dev/null || printf '0')"
   if [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]; then
-    preflight_ok "Instance type $NODE_TYPE is offered in $AWS_REGION ($count AZs)"
+    preflight_ok "$label instance type $instance_type is offered in $AWS_REGION ($count AZs)"
   else
-    preflight_fail "Instance type $NODE_TYPE does not appear available in $AWS_REGION"
+    preflight_fail "$label instance type $instance_type does not appear available in $AWS_REGION"
+  fi
+}
+
+check_instance_offerings() {
+  check_instance_offering_for "Guardrails" "$GUARDRAIL_NODE_TYPE"
+  if [[ "$ENABLE_RED_TEAM" == "true" ]]; then
+    check_instance_offering_for "Red Team" "$RED_TEAM_NODE_TYPE"
   fi
 }
 
@@ -428,12 +443,12 @@ check_eksctl_cluster_config() {
     --region "$AWS_REGION" \
     --version "$K8S_VERSION" \
     --managed \
-    --nodegroup-name "$NODEGROUP_NAME" \
-    --node-type "$NODE_TYPE" \
-    --nodes "$NODE_COUNT" \
-    --nodes-min "$NODE_MIN" \
-    --nodes-max "$NODE_MAX" \
-    --node-volume-size "$NODE_VOLUME_SIZE" \
+    --nodegroup-name "$GUARDRAIL_NODEGROUP_NAME" \
+    --node-type "$GUARDRAIL_NODE_TYPE" \
+    --nodes "$GUARDRAIL_NODE_COUNT" \
+    --nodes-min "$GUARDRAIL_NODE_MIN" \
+    --nodes-max "$GUARDRAIL_NODE_MAX" \
+    --node-volume-size "$GUARDRAIL_NODE_VOLUME_SIZE" \
     --node-ami-family "$NODE_AMI_FAMILY" \
     --vpc-nat-mode "$VPC_NAT_MODE" \
     --dry-run >/dev/null 2>&1; then
@@ -504,7 +519,10 @@ preflight_up() {
   print_heading "Guardrails PoC preflight" "========================"
   printf 'Config file:            %s\n' "$CONFIG_FILE"
   printf 'Cluster:                %s (%s)\n' "$CLUSTER_NAME" "$AWS_REGION"
-  printf 'Node group:             %s (%s x %s)\n' "$NODEGROUP_NAME" "$NODE_COUNT" "$NODE_TYPE"
+  printf 'Guardrails node group:  %s (%s x %s)\n' "$GUARDRAIL_NODEGROUP_NAME" "$GUARDRAIL_NODE_COUNT" "$GUARDRAIL_NODE_TYPE"
+  if [[ "$ENABLE_RED_TEAM" == "true" ]]; then
+    printf 'Red Team node group:    %s (%s x %s)\n' "$RED_TEAM_NODEGROUP_NAME" "$RED_TEAM_NODE_COUNT" "$RED_TEAM_NODE_TYPE"
+  fi
   printf 'Hostname:               %s\n' "$HOSTNAME"
   printf 'Route 53 managed:       %s\n' "$ROUTE53_ENABLED"
   printf 'Red Team enabled:       %s\n' "$ENABLE_RED_TEAM"
@@ -529,7 +547,7 @@ preflight_up() {
     check_aws_credentials
     check_aws_region
     check_route53_zone
-    check_instance_offering
+    check_instance_offerings
     check_gpu_quota
 
     printf '\n%s\n' "$(color_text "$COLOR_BOLD" "Deployment validation")"
@@ -560,6 +578,11 @@ cluster_exists() {
 addon_exists() {
   local addon="$1"
   aws eks describe-addon --cluster-name "$CLUSTER_NAME" --addon-name "$addon" --region "$AWS_REGION" >/dev/null 2>&1
+}
+
+nodegroup_exists() {
+  local nodegroup="$1"
+  aws eks describe-nodegroup --cluster-name "$CLUSTER_NAME" --nodegroup-name "$nodegroup" --region "$AWS_REGION" >/dev/null 2>&1
 }
 
 resolve_hosted_zone_id() {
@@ -630,17 +653,28 @@ PY
 
 create_cluster() {
   if [[ "$DRY_RUN" == true ]]; then
-    run eksctl create cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" --version "$K8S_VERSION" --managed --nodegroup-name "$NODEGROUP_NAME" --node-type "$NODE_TYPE" --nodes "$NODE_COUNT" --nodes-min "$NODE_MIN" --nodes-max "$NODE_MAX" --node-volume-size "$NODE_VOLUME_SIZE" --node-ami-family "$NODE_AMI_FAMILY" --install-nvidia-plugin --vpc-nat-mode "$VPC_NAT_MODE"
+    run eksctl create cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" --version "$K8S_VERSION" --managed --nodegroup-name "$GUARDRAIL_NODEGROUP_NAME" --node-type "$GUARDRAIL_NODE_TYPE" --nodes "$GUARDRAIL_NODE_COUNT" --nodes-min "$GUARDRAIL_NODE_MIN" --nodes-max "$GUARDRAIL_NODE_MAX" --node-volume-size "$GUARDRAIL_NODE_VOLUME_SIZE" --node-ami-family "$NODE_AMI_FAMILY" --install-nvidia-plugin --vpc-nat-mode "$VPC_NAT_MODE"
+    if [[ "$ENABLE_RED_TEAM" == "true" ]]; then
+      run eksctl create nodegroup --cluster "$CLUSTER_NAME" --region "$AWS_REGION" --name "$RED_TEAM_NODEGROUP_NAME" --node-type "$RED_TEAM_NODE_TYPE" --nodes "$RED_TEAM_NODE_COUNT" --nodes-min "$RED_TEAM_NODE_MIN" --nodes-max "$RED_TEAM_NODE_MAX" --node-volume-size "$RED_TEAM_NODE_VOLUME_SIZE" --node-ami-family "$NODE_AMI_FAMILY" --managed --install-nvidia-plugin
+    fi
     return
   fi
 
   if cluster_exists; then
     log "EKS cluster already exists: $CLUSTER_NAME"
   else
-    run eksctl create cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" --version "$K8S_VERSION" --managed --nodegroup-name "$NODEGROUP_NAME" --node-type "$NODE_TYPE" --nodes "$NODE_COUNT" --nodes-min "$NODE_MIN" --nodes-max "$NODE_MAX" --node-volume-size "$NODE_VOLUME_SIZE" --node-ami-family "$NODE_AMI_FAMILY" --install-nvidia-plugin --vpc-nat-mode "$VPC_NAT_MODE"
+    run eksctl create cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" --version "$K8S_VERSION" --managed --nodegroup-name "$GUARDRAIL_NODEGROUP_NAME" --node-type "$GUARDRAIL_NODE_TYPE" --nodes "$GUARDRAIL_NODE_COUNT" --nodes-min "$GUARDRAIL_NODE_MIN" --nodes-max "$GUARDRAIL_NODE_MAX" --node-volume-size "$GUARDRAIL_NODE_VOLUME_SIZE" --node-ami-family "$NODE_AMI_FAMILY" --install-nvidia-plugin --vpc-nat-mode "$VPC_NAT_MODE"
   fi
 
   run aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+  if [[ "$ENABLE_RED_TEAM" == "true" ]]; then
+    if nodegroup_exists "$RED_TEAM_NODEGROUP_NAME"; then
+      log "Red Team node group already exists: $RED_TEAM_NODEGROUP_NAME"
+    else
+      run eksctl create nodegroup --cluster "$CLUSTER_NAME" --region "$AWS_REGION" --name "$RED_TEAM_NODEGROUP_NAME" --node-type "$RED_TEAM_NODE_TYPE" --nodes "$RED_TEAM_NODE_COUNT" --nodes-min "$RED_TEAM_NODE_MIN" --nodes-max "$RED_TEAM_NODE_MAX" --node-volume-size "$RED_TEAM_NODE_VOLUME_SIZE" --node-ami-family "$NODE_AMI_FAMILY" --managed --install-nvidia-plugin
+    fi
+  fi
 }
 
 install_storage_addons() {
@@ -723,7 +757,7 @@ apply_security_operator() {
     local red_team_label="disabled"
     [[ "$ENABLE_RED_TEAM" == "true" ]] && red_team_label="enabled"
     printf '+ kubectl apply -f <SecurityOperator manifest for %s>\n' "$SECURITY_OPERATOR_NAME"
-    printf '  SecurityOperator manifest: Guardrails enabled, Red Team %s, in-cluster PostgreSQL enabled, CAI_MODERATOR_BASE_URL=https://%s\n' "$red_team_label" "$HOSTNAME"
+    printf '  SecurityOperator manifest: Guardrails enabled on %s, Red Team %s on %s, in-cluster PostgreSQL enabled, CAI_MODERATOR_BASE_URL=https://%s\n' "$GUARDRAIL_NODEGROUP_NAME" "$red_team_label" "$RED_TEAM_NODEGROUP_NAME" "$HOSTNAME"
     return
   fi
 
@@ -738,9 +772,19 @@ apply_security_operator() {
   POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   F5_LICENSE_STRING="$F5_LICENSE_STRING" \
   ENABLE_RED_TEAM="$ENABLE_RED_TEAM" \
+  GUARDRAIL_NODEGROUP_NAME="$GUARDRAIL_NODEGROUP_NAME" \
+  RED_TEAM_NODEGROUP_NAME="$RED_TEAM_NODEGROUP_NAME" \
   python3 - <<'PY'
 import os
 from pathlib import Path
+
+redteam_enabled = os.environ["ENABLE_RED_TEAM"].lower()
+redteam_profile = ""
+if redteam_enabled == "true":
+    redteam_profile = f"""          nvidia-gpu-l40s:
+            nodeSelector:
+              eks.amazonaws.com/nodegroup: {os.environ['RED_TEAM_NODEGROUP_NAME']}
+"""
 
 manifest = f"""apiVersion: ai.security.f5.com/v1alpha1
 kind: SecurityOperator
@@ -773,7 +817,13 @@ spec:
         guardrails:
           enabled: true
         redteam:
-          enabled: {os.environ['ENABLE_RED_TEAM'].lower()}
+          enabled: {redteam_enabled}
+      kubeai:
+        resourceProfiles:
+          nvidia-gpu-a10g:
+            nodeSelector:
+              eks.amazonaws.com/nodegroup: {os.environ['GUARDRAIL_NODEGROUP_NAME']}
+{redteam_profile}
 """
 Path(os.environ["MANIFEST_PATH"]).write_text(manifest, encoding="utf-8")
 PY
@@ -1224,6 +1274,21 @@ node_health() {
   fi
 }
 
+nodegroup_health() {
+  local nodegroup="$1"
+  local status desired min max instance_type
+  status="$(aws eks describe-nodegroup --cluster-name "$CLUSTER_NAME" --nodegroup-name "$nodegroup" --region "$AWS_REGION" --query 'nodegroup.status' --output text 2>/dev/null || true)"
+  if [[ -z "$status" || "$status" == "None" ]]; then
+    printf 'not found'
+    return
+  fi
+  desired="$(aws eks describe-nodegroup --cluster-name "$CLUSTER_NAME" --nodegroup-name "$nodegroup" --region "$AWS_REGION" --query 'nodegroup.scalingConfig.desiredSize' --output text 2>/dev/null || true)"
+  min="$(aws eks describe-nodegroup --cluster-name "$CLUSTER_NAME" --nodegroup-name "$nodegroup" --region "$AWS_REGION" --query 'nodegroup.scalingConfig.minSize' --output text 2>/dev/null || true)"
+  max="$(aws eks describe-nodegroup --cluster-name "$CLUSTER_NAME" --nodegroup-name "$nodegroup" --region "$AWS_REGION" --query 'nodegroup.scalingConfig.maxSize' --output text 2>/dev/null || true)"
+  instance_type="$(aws eks describe-nodegroup --cluster-name "$CLUSTER_NAME" --nodegroup-name "$nodegroup" --region "$AWS_REGION" --query 'nodegroup.instanceTypes[0]' --output text 2>/dev/null || true)"
+  printf '%s, %s desired (%s-%s), type %s' "$status" "${desired:-unknown}" "${min:-?}" "${max:-?}" "${instance_type:-unknown}"
+}
+
 public_url_health() {
   if [[ "$ROUTE53_ENABLED" != "true" ]]; then
     printf 'not verified (DNS not managed by script)'
@@ -1387,6 +1452,10 @@ status() {
   fi
   status_line "EKS cluster" "${cluster_status:-unknown}, Kubernetes ${cluster_version:-unknown}, region $AWS_REGION"
   status_line "Node" "$(node_health)"
+  status_line "Guardrails node group" "$(nodegroup_health "$GUARDRAIL_NODEGROUP_NAME")"
+  if [[ "$ENABLE_RED_TEAM" == "true" ]]; then
+    status_line "Red Team node group" "$(nodegroup_health "$RED_TEAM_NODEGROUP_NAME")"
+  fi
   status_line "Storage" "$(storage_health)"
   status_line "f5-ai-security-operator" "$(deployment_health "$F5_NAMESPACE" controller-manager)"
   status_line "cai-moderator" "$(pod_health "$MODERATOR_NAMESPACE")"
