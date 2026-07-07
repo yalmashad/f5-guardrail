@@ -166,7 +166,7 @@ load_config() {
   GUARDRAILS_DEFAULT_USERNAME="${GUARDRAILS_DEFAULT_USERNAME:-admin}"
   GUARDRAILS_DEFAULT_PASSWORD="${GUARDRAILS_DEFAULT_PASSWORD:-pass}"
   GUARDRAILS_AUTH_REALMS="${GUARDRAILS_AUTH_REALMS:-master calypsoai}"
-  GUARDRAILS_ENABLE_RED_TEAM="${GUARDRAILS_ENABLE_RED_TEAM:-false}"
+  ENABLE_RED_TEAM="${ENABLE_RED_TEAM:-false}"
   HARBOR_REGISTRY="${HARBOR_REGISTRY:-harbor.calypsoai.app}"
   HARBOR_CREDENTIALS_FILE="${HARBOR_CREDENTIALS_FILE:-}"
   F5_LICENSE_FILE="${F5_LICENSE_FILE:-}"
@@ -340,7 +340,7 @@ check_harbor_file_format() {
 check_aws_credentials() {
   local identity account arn
   if ! identity="$(aws sts get-caller-identity --output json 2>/dev/null)"; then
-    preflight_fail "AWS credentials are not working. Run aws configure, export AWS_PROFILE, or aws sso login."
+    preflight_fail "AWS credentials are not working. Run aws configure."
     return
   fi
 
@@ -507,7 +507,7 @@ preflight_up() {
   printf 'Node group:             %s (%s x %s)\n' "$NODEGROUP_NAME" "$NODE_COUNT" "$NODE_TYPE"
   printf 'Hostname:               %s\n' "$HOSTNAME"
   printf 'Route 53 managed:       %s\n' "$ROUTE53_ENABLED"
-  printf 'Red Team enabled:       %s\n' "$GUARDRAILS_ENABLE_RED_TEAM"
+  printf 'Red Team enabled:       %s\n' "$ENABLE_RED_TEAM"
   printf '\n%s\n' "$(color_text "$COLOR_BOLD" "Local tools")"
   for cmd in aws kubectl helm eksctl openssl python3 curl; do
     check_command "$cmd"
@@ -721,7 +721,7 @@ install_operator() {
 apply_security_operator() {
   if [[ "$DRY_RUN" == true ]]; then
     local red_team_label="disabled"
-    [[ "$GUARDRAILS_ENABLE_RED_TEAM" == "true" ]] && red_team_label="enabled"
+    [[ "$ENABLE_RED_TEAM" == "true" ]] && red_team_label="enabled"
     printf '+ kubectl apply -f <SecurityOperator manifest for %s>\n' "$SECURITY_OPERATOR_NAME"
     printf '  SecurityOperator manifest: Guardrails enabled, Red Team %s, in-cluster PostgreSQL enabled, CAI_MODERATOR_BASE_URL=https://%s\n' "$red_team_label" "$HOSTNAME"
     return
@@ -737,7 +737,7 @@ apply_security_operator() {
   HOSTNAME="$HOSTNAME" \
   POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   F5_LICENSE_STRING="$F5_LICENSE_STRING" \
-  GUARDRAILS_ENABLE_RED_TEAM="$GUARDRAILS_ENABLE_RED_TEAM" \
+  ENABLE_RED_TEAM="$ENABLE_RED_TEAM" \
   python3 - <<'PY'
 import os
 from pathlib import Path
@@ -773,7 +773,7 @@ spec:
         guardrails:
           enabled: true
         redteam:
-          enabled: {os.environ['GUARDRAILS_ENABLE_RED_TEAM'].lower()}
+          enabled: {os.environ['ENABLE_RED_TEAM'].lower()}
 """
 Path(os.environ["MANIFEST_PATH"]).write_text(manifest, encoding="utf-8")
 PY
@@ -1391,7 +1391,7 @@ status() {
   status_line "f5-ai-security-operator" "$(deployment_health "$F5_NAMESPACE" controller-manager)"
   status_line "cai-moderator" "$(pod_health "$MODERATOR_NAMESPACE")"
   status_line "f5-ai-sec-inference" "$(pod_health "$INFERENCE_NAMESPACE")"
-  if [[ "$GUARDRAILS_ENABLE_RED_TEAM" == "true" ]]; then
+  if [[ "$ENABLE_RED_TEAM" == "true" ]]; then
     status_line "Red Team" "enabled"
   else
     status_line "Red Team" "disabled"

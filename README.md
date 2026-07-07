@@ -1,4 +1,4 @@
-# F5 AI Security Guardrails on Amazon EKS
+# F5 AI Security on Amazon EKS
 
 This repository automates a single-node Amazon EKS proof of concept for F5 AI Security Guardrails.
 
@@ -13,7 +13,7 @@ The PoC uses:
 - Optional Route 53 DNS management
 - Self-signed TLS for lab access
 
-> This is a PoC, not a production reference architecture. Do not commit real Harbor credentials, license strings, passwords, or generated secrets.
+Route 53 is optional. If you do not use Route 53, the script still deploys the environment and prints the ingress load balancer hostname so you can create DNS manually with another provider.
 
 ## Architecture
 
@@ -82,13 +82,10 @@ Required inputs:
 - F5 AI Security license string
 - LLM provider credentials for post-install app configuration
 
-Configure AWS on each machine before running the script:
+Configure AWS CLI:
 
 ```bash
 aws configure
-# or
-export AWS_PROFILE=<profile-name>
-aws sso login --profile <profile-name>
 ```
 
 Run preflight:
@@ -133,7 +130,7 @@ Important feature toggles:
 
 ```bash
 ROUTE53_ENABLED="false"
-GUARDRAILS_ENABLE_RED_TEAM="false"
+ENABLE_RED_TEAM="false"
 ```
 
 When Route 53 is disabled, the script still creates the ingress load balancer and prints its hostname. You can then create DNS manually with any DNS provider. Set `ROUTE53_ENABLED=true` to let the script honor `ROUTE53_ZONE_NAME` and `ROUTE53_HOSTED_ZONE_ID`.
@@ -141,22 +138,6 @@ When Route 53 is disabled, the script still creates the ingress load balancer an
 When Red Team is enabled, make sure the license covers Red Team and the node group has enough dedicated GPU capacity.
 
 Relative paths are resolved from the repository root.
-
-Create local secret files:
-
-```bash
-printf '%s\n%s\n' '<harbor username>' '<harbor password>' > config/harbor.txt
-printf '%s\n' '<F5 license string>' > config/license.txt
-chmod 600 config/harbor.txt config/license.txt
-```
-
-These files are ignored by Git. You can also supply secrets with environment variables:
-
-```bash
-export HARBOR_USERNAME='<harbor username>'
-export HARBOR_PASSWORD='<harbor password>'
-export F5_LICENSE_STRING='<F5 license string>'
-```
 
 ### Deploy
 
@@ -195,15 +176,13 @@ nginx-ingress:             ready (1/1 replicas)
 EBS leftovers:             none found
 ```
 
-### Stop and Remove Cost
+### Stop and Delete
 
 ```bash
 ./scripts/guardrails-poc.sh down --yes
 ```
 
 This deletes Route 53 records when enabled, the EKS cluster, GPU node group, load balancer, EBS volumes created through the cluster, available leftover cluster-owned EBS volumes, and `eksctl` CloudFormation stacks.
-
-This delete-and-recreate model is slower than scaling a node group to zero, but it removes EKS control-plane and GPU-node cost.
 
 ## First Login and Password Change
 
@@ -332,15 +311,3 @@ kubectl logs -n prefect deploy/prefect-server --tail=100
 ```
 
 If Route 53 is enabled and the public URL is not reachable immediately after the record is updated, wait a few minutes for DNS propagation and local resolver cache refresh. If Route 53 is disabled, create a DNS record manually that points your hostname to the ingress load balancer.
-
-## Production Considerations
-
-For production, change the following:
-
-- Use trusted TLS with ACM or cert-manager.
-- Use external PostgreSQL such as Amazon RDS.
-- Use private node networking and controlled egress.
-- Add backup and restore for PostgreSQL.
-- Use larger or separate node groups for CPU and GPU workloads.
-- Use least-privilege AWS IAM permissions.
-- Store secrets in a proper secret manager.
