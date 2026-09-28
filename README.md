@@ -148,6 +148,20 @@ RED_TEAM_NODE_TYPE="g6e.2xlarge"
 
 Relative paths are resolved from the repository root.
 
+### Check Available Operator Chart Versions
+
+To verify or update to the latest F5 AI Security Operator version in Harbor before installing:
+
+```bash
+# Log in to Harbor
+sed -n '1p' config/harbor.txt | helm registry login harbor.calypsoai.app --username $(sed -n '1p' config/harbor.txt) --password-stdin < <(sed -n '2p' config/harbor.txt)
+
+# Check latest chart version
+helm show chart oci://harbor.calypsoai.app/calypsoai/f5-ai-security-operator-helm
+```
+
+Update `OPERATOR_CHART_VERSION` in `config/guardrails-poc.env` with the desired version tag.
+
 ### Deploy
 
 ```bash
