@@ -805,6 +805,13 @@ spec:
   moderator:
     enabled: true
     values:
+      resources:
+        requests:
+          cpu: 4
+          memory: 8Gi
+        limits:
+          cpu: 10
+          memory: 24Gi
       env:
         CAI_MODERATOR_BASE_URL: https://{os.environ['HOSTNAME']}
       secrets:
@@ -820,6 +827,9 @@ spec:
           enabled: {redteam_enabled}
       kubeai:
         resourceProfiles:
+          guardrails:
+            nodeSelector:
+              eks.amazonaws.com/nodegroup: {os.environ['GUARDRAIL_NODEGROUP_NAME']}
           nvidia-gpu-a10g:
             nodeSelector:
               eks.amazonaws.com/nodegroup: {os.environ['GUARDRAIL_NODEGROUP_NAME']}
@@ -827,6 +837,7 @@ spec:
 """
 Path(os.environ["MANIFEST_PATH"]).write_text(manifest, encoding="utf-8")
 PY
+  kubectl delete model cai-phi-4-gptq-4bit -n "$INFERENCE_NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
   kubectl apply -f "$manifest"
   rm -f "$manifest"
 }
